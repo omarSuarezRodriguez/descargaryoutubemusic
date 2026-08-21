@@ -54,6 +54,42 @@ def find_ffmpeg() -> Path | None:
     return None
 
 
+def build_download_cmd(
+    base_cmd: list[str],
+    url: str,
+    out_dir: Path,
+    format_mode: str,
+    ffmpeg: Path | None,
+) -> list[str]:
+    """Arma el comando yt-dlp según MP3 (convertir) o WebM (tal cual)."""
+    cmd = [
+        *base_cmd,
+        "-f",
+        "bestaudio",
+        "-o",
+        str(out_dir / "%(title)s.%(ext)s"),
+        "--no-playlist",
+    ]
+    if format_mode == "webm":
+        # Audio original de YouTube (casi siempre Opus en .webm)
+        pass
+    else:
+        # MP3 máxima calidad VBR
+        cmd.extend(
+            [
+                "-x",
+                "--audio-format",
+                "mp3",
+                "--audio-quality",
+                "0",
+            ]
+        )
+        if ffmpeg:
+            cmd.extend(["--ffmpeg-location", str(ffmpeg.parent)])
+    cmd.append(url)
+    return cmd
+
+
 def parse_urls(text: str) -> list[str]:
     """Extrae URLs válidas de YouTube / YouTube Music, una por línea o separadas."""
     urls: list[str] = []
@@ -91,6 +127,7 @@ class App(tk.Tk):
         self._busy = False
         self._last_clip: str | None = None
         self.clipboard_watch = tk.BooleanVar(value=True)
+        self.format_mode = tk.StringVar(value="mp3")
 
         self._build_ui()
         self.after(100, self._drain_log_queue)
@@ -117,6 +154,22 @@ class App(tk.Tk):
             text="Pegar automáticamente del portapapeles",
             variable=self.clipboard_watch,
         ).pack(side=tk.LEFT)
+
+        format_row = ttk.Frame(root)
+        format_row.pack(fill=tk.X, **pad)
+        ttk.Label(format_row, text="Formato:").pack(side=tk.LEFT)
+        ttk.Radiobutton(
+            format_row,
+            text="MP3 (compatible)",
+            variable=self.format_mode,
+            value="mp3",
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Radiobutton(
+            format_row,
+            text="WebM (tal cual YouTube)",
+            variable=self.format_mode,
+            value="webm",
+        ).pack(side=tk.LEFT, padx=(12, 0))
 
         folder_row = ttk.Frame(root)
         folder_row.pack(fill=tk.X, **pad)
@@ -207,14 +260,9 @@ class App(tk.Tk):
             self._log(f"ffmpeg: {self._ffmpeg}")
         else:
             self._log(
-                "AVISO: no se encontró ffmpeg. Sin él no se puede convertir a MP3.\n"
+                "AVISO: no se encontró ffmpeg. Hace falta para convertir a MP3.\n"
+                "El modo WebM (tal cual) funciona sin ffmpeg.\n"
                 "Instálalo (winget install Gyan.FFmpeg) o agrégalo al PATH."
-            )
-            messagebox.showwarning(
-                "Falta ffmpeg",
-                "No se encontró ffmpeg.\n\n"
-                "Sin ffmpeg la descarga puede quedar en .webm/.m4a y no en MP3.\n"
-                "Instala con: winget install Gyan.FFmpeg",
             )
 
     def _log(self, message: str) -> None:
@@ -260,12 +308,24 @@ class App(tk.Tk):
         self._stop_flag.clear()
         self.progress.configure(maximum=len(urls), value=0)
         self._set_busy(True)
+        mode = self.format_mode.get()
+        mode_label = "MP3 (compatible)" if mode == "mp3" else "WebM (tal cual YouTube)"
+        if mode == "mp3" and not self._ffmpeg:
+            messagebox.showwarning(
+                "Falta ffmpeg",
+                "No se encontró ffmpeg.\n\n"
+                "Sin ffmpeg no se puede convertir a MP3.\n"
+                "Usa el modo WebM o instala: winget install Gyan.FFmpeg",
+            )
+            self._set_busy(False)
+            return
         self._log(f"Iniciando descarga de {len(urls)} enlace(s)…")
+        self._log(f"Formato: {mode_label}")
         self._log(f"Carpeta: {out_dir}")
 
         self._worker = threading.Thread(
             target=self._download_all,
-            args=(urls, out_dir),
+            args=(urls, out_dir, mode),
             daemon=True,
         )
         self._worker.start()
@@ -274,7 +334,7 @@ class App(tk.Tk):
         self._stop_flag.set()
         self._log("Detención solicitada… (terminará el archivo actual)")
 
-    def _download_all(self, urls: list[str], out_dir: Path) -> None:
+    def _download_all(self, urls: list[str], out_dir: Path, format_mode: str) -> None:
         base_cmd = find_yt_dlp()
         ok = 0
         fail = 0
@@ -285,22 +345,9 @@ class App(tk.Tk):
                 break
 
             self._log(f"\n[{index}/{len(urls)}] {url}")
-            cmd = [
-                *base_cmd,
-                "-f",
-                "bestaudio",
-                "-x",
-                "--audio-format",
-                "mp3",
-                "--audio-quality",
-                "0",
-                "-o",
-                str(out_dir / "%(title)s.%(ext)s"),
-                "--no-playlist",
-            ]
-            if self._ffmpeg:
-                cmd.extend(["--ffmpeg-location", str(self._ffmpeg.parent)])
-            cmd.append(url)
+            cmd = build_download_cmd(
+                base_cmd, url, out_dir, format_mode, self._ffmpeg
+            )
 
             try:
                 process = subprocess.Popen(
