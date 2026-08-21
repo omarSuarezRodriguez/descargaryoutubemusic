@@ -1,7 +1,7 @@
 """
 Descargador de playlists / álbumes desde YouTube Music / YouTube.
 Clon funcional de descargar_musica.py orientado a playlists:
-cada playlist se guarda en CarpetaBase / NombreÁlbum /.
+cada playlist se guarda en CarpetaBase / Artista - Álbum (año) /.
 
 NO modifica descargar_musica.py.
 """
@@ -29,46 +29,170 @@ from descargar_musica import (
 )
 from metadata_extras import attach_lyrics_and_cover
 
+# Uploaders/canales que NO son el artista del álbum
+_INVALID_ARTISTS = {
+    "",
+    "youtube",
+    "youtube music",
+    "youtubemusic",
+    "various artists",
+    "varios artistas",
+    "varios",
+    "unknown artist",
+    "unknown",
+    "topic",
+}
 
-def playlist_artist_name(playlist_info: dict) -> str:
-    """Artista/uploader limpio para el nombre de carpeta."""
-    artist = (
-        playlist_info.get("artist")
-        or playlist_info.get("album_artist")
-        or playlist_info.get("creator")
-        or playlist_info.get("uploader")
-        or playlist_info.get("channel")
-        or playlist_info.get("playlist_uploader")
-        or ""
-    )
-    if isinstance(artist, list):
-        artist = ", ".join(str(a) for a in artist if a)
-    artist = str(artist).strip()
-    # YouTube Music suele poner "Artist - Topic"
+
+def _as_text(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        parts = [_as_text(v) for v in value if v]
+        return ", ".join(p for p in parts if p)
+    if isinstance(value, dict):
+        return _as_text(value.get("name") or value.get("text") or "")
+    return str(value).strip()
+
+
+def _clean_artist(raw: object) -> str:
+    """Normaliza artista y descarta valores inútiles de YouTube."""
+    artist = _as_text(raw)
     if artist.casefold().endswith(" - topic"):
         artist = artist[: -len(" - Topic")].strip()
+    if artist.casefold() in _INVALID_ARTISTS:
+        return ""
     return artist
 
 
-def playlist_album_name(playlist_info: dict) -> str:
+def artist_from_info(info: dict) -> str:
+    """Extrae artista usable de metadatos de playlist o pista."""
+    if not isinstance(info, dict):
+        return ""
+    for key in (
+        "artist",
+        "album_artist",
+        "creator",
+        "artists",
+        "uploader",
+        "channel",
+        "playlist_uploader",
+        "playlist_channel",
+    ):
+        artist = _clean_artist(info.get(key))
+        if artist:
+            return artist
+    return ""
+
+
+def artist_from_title(title: str) -> str:
+    """Último recurso: 'Artista - Canción' en el título."""
+    title = (title or "").strip()
+    if " - " not in title:
+        return ""
+    left, _right = title.split(" - ", 1)
+    return _clean_artist(left)
+
+
+def playlist_artist_name(playlist_info: dict) -> str:
+    """Artista a nivel playlist (puede estar vacío con --flat-playlist)."""
+    return artist_from_info(playlist_info)
+
+
+def strip_artist_from_album(album_name: str, artist: str) -> str:
+    """Quita 'Artista - ' / 'Artista ' del inicio del álbum si viene duplicado."""
+    album_name = (album_name or "").strip() or "playlist"
+    artist = (artist or "").strip()
+    if not artist:
+        return album_name
+    dash_prefix = f"{artist} - "
+    if album_name.casefold().startswith(dash_prefix.casefold()):
+        return album_name[len(dash_prefix) :].strip() or album_name
+    prefix = f"{artist} "
+    if album_name.casefold().startswith(prefix.casefold()):
+        rest = album_name[len(prefix) :].strip()
+        return rest or album_name
+    return album_name
+
+
+def playlist_album_name(playlist_info: dict, artist: str = "") -> str:
     """Nombre de álbum/playlist limpio (sin artista duplicado)."""
-    album = (playlist_info.get("album") or "").strip()
-    if isinstance(album, list):
-        album = str(album[0]).strip() if album else ""
+    album = _as_text(playlist_info.get("album"))
     title = (
         playlist_info.get("title") or playlist_info.get("playlist_title") or ""
     ).strip()
     album_name = album or title or "playlist"
+    if not artist:
+        artist = playlist_artist_name(playlist_info)
+    return strip_artist_from_album(album_name, artist)
+
+
+def resolve_playlist_artist(
+    playlist_info: dict,
+    base_cmd: list[str] | None = None,
+    log=None,
+) -> tuple[str, dict | None]:
+    """
+    Cascada de artista: playlist -> entradas flat -> primera pista completa -> título.
+    Devuelve (artista, info_pista_completa|None).
+    """
     artist = playlist_artist_name(playlist_info)
     if artist:
-        dash_prefix = f"{artist} - "
-        if album_name.casefold().startswith(dash_prefix.casefold()):
-            return album_name[len(dash_prefix) :].strip() or album_name
-        prefix = f"{artist} "
-        if album_name.casefold().startswith(prefix.casefold()):
-            rest = album_name[len(prefix) :].strip()
-            return rest or album_name
-    return album_name
+        if log:
+            log(f"Artista (playlist): {artist}")
+        return artist, None
+
+    entries = playlist_info.get("entries") or []
+    for entry in entries[:8]:
+        if not isinstance(entry, dict):
+            continue
+        artist = artist_from_info(entry)
+        if artist:
+            if log:
+                log(f"Artista (entrada): {artist}")
+            return artist, None
+
+    track_info: dict | None = None
+    if base_cmd:
+        for entry in entries[:3]:
+            if not isinstance(entry, dict):
+                continue
+            url = entry_watch_url(entry)
+            if not url:
+                continue
+            try:
+                if log:
+                    log("Buscando artista en metadatos de la primera pista…")
+                track_info = fetch_video_info(base_cmd, url)
+            except Exception as exc:  # noqa: BLE001
+                if log:
+                    log(f"AVISO: no se pudieron leer metadatos de pista: {exc}")
+                track_info = None
+                continue
+            artist = artist_from_info(track_info)
+            if artist:
+                if log:
+                    log(f"Artista (pista completa): {artist}")
+                return artist, track_info
+            # Título de la pista completa (mejor que flat)
+            artist = artist_from_title(_as_text(track_info.get("title")))
+            if artist:
+                if log:
+                    log(f"Artista (título pista): {artist}")
+                return artist, track_info
+
+    for entry in entries[:8]:
+        if not isinstance(entry, dict):
+            continue
+        artist = artist_from_title(_as_text(entry.get("title")))
+        if artist:
+            if log:
+                log(f"Artista (título entrada): {artist}")
+            return artist, track_info
+
+    if log:
+        log("AVISO: no se encontró artista para la carpeta")
+    return "", track_info
 
 
 def _year_from_text(value: object) -> str | None:
@@ -240,9 +364,13 @@ def fetch_musicbrainz_album_year(artist: str, album: str) -> str | None:
 
 
 def resolve_album_year(
-    playlist_info: dict, artist: str, album: str, log=None
+    playlist_info: dict,
+    artist: str,
+    album: str,
+    log=None,
+    track_info: dict | None = None,
 ) -> str | None:
-    """YouTube -> iTunes -> MusicBrainz."""
+    """YouTube (playlist/entradas) -> iTunes -> MusicBrainz -> pista completa."""
     y = year_from_youtube_info(playlist_info)
     if y:
         if log:
@@ -266,19 +394,47 @@ def resolve_album_year(
         if log:
             log(f"Año (MusicBrainz): {y}")
         return y
+    # Último recurso: release de una pista (puede ser remaster)
+    if isinstance(track_info, dict):
+        y = year_from_youtube_info(track_info)
+        if y:
+            if log:
+                log(f"Año (YouTube pista completa): {y}")
+            return y
     if log:
         log("AVISO: no se encontró año del álbum")
     return None
 
 
-def playlist_folder_name(playlist_info: dict, log=None) -> str:
+def playlist_folder_name(
+    playlist_info: dict,
+    log=None,
+    base_cmd: list[str] | None = None,
+) -> str:
     """
     Nombre de carpeta: 'Artista - Álbum (YYYY)'
     Si no hay año: 'Artista - Álbum'
+    Enriquece artista/álbum desde entradas o la primera pista si el flat JSON viene pobre.
     """
-    artist = playlist_artist_name(playlist_info)
-    album_name = playlist_album_name(playlist_info)
-    year = resolve_album_year(playlist_info, artist, album_name, log=log)
+    artist, track_info = resolve_playlist_artist(
+        playlist_info, base_cmd=base_cmd, log=log
+    )
+
+    album_name = playlist_album_name(playlist_info, artist=artist)
+    if isinstance(track_info, dict):
+        track_album = _as_text(track_info.get("album"))
+        if track_album:
+            album_name = strip_artist_from_album(track_album, artist)
+            if log:
+                log(f"Álbum (pista completa): {album_name}")
+
+    year = resolve_album_year(
+        playlist_info,
+        artist,
+        album_name,
+        log=log,
+        track_info=track_info,
+    )
 
     if artist and album_name:
         base = f"{artist} - {album_name}"
@@ -656,14 +812,13 @@ class PlaylistApp(tk.Tk):
             self._log(purl)
             try:
                 plist = fetch_playlist_info(base_cmd, purl)
-                folder = playlist_folder_name(plist, log=self._log)
                 entries = playlist_entries(plist)
                 if not entries and plist.get("id") and plist.get("_type") != "playlist":
                     # URL de un solo vídeo: tratar como “álbum” de 1 pista
                     entries = [plist]
-                    folder = playlist_folder_name(plist, log=self._log) or clean_filename(
-                        song_artist_basename(plist)
-                    )
+                folder = playlist_folder_name(
+                    plist, log=self._log, base_cmd=base_cmd
+                ) or clean_filename(song_artist_basename(plist))
                 if not entries:
                     counters["fail"] += 1
                     self._log("✗ Playlist vacía o no se pudieron listar pistas")

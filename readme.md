@@ -1,4 +1,4 @@
-## v1.07
+## v1.08
 
 - Tras cada descarga nueva: busca letra (LRCLIB) y carátula.
 - Carátula: catálogo iTunes → si no, miniatura de YouTube Music.
@@ -314,6 +314,16 @@ Núcleo compartido de extras en metadata_extras.py
 
 
 ############################
+## v1.08
+
+
+
+Mejoras implementadas
+
+
+
+
+########################
 
 
 
