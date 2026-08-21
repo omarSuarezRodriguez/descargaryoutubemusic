@@ -1,4 +1,4 @@
-## v1.05
+## v1.06
 
 - Tras cada descarga nueva: busca letra (LRCLIB) y carátula.
 - Carátula: catálogo iTunes → si no, miniatura de YouTube Music.
@@ -110,3 +110,61 @@ App de escritorio en Python (Tkinter) para descargar audio desde YouTube / YouTu
 
 
 #################
+## v1.06
+
+
+
+
+```markdown
+# Descargar YouTube Music
+
+App de escritorio en Python (Tkinter) para descargar audio desde YouTube / YouTube Music en lote.
+
+## Cómo abrirla
+- Doble clic en `iniciar.bat`, o:
+- `python descargar_musica.py`
+- Dependencias: `yt-dlp`, `mutagen` y `ffmpeg` (necesario para MP3 y Opus)
+
+## Qué hace
+
+### Descarga
+- Caja de texto para varios enlaces (uno por línea)
+- Botón **Descargar**: procesa en orden, uno a uno
+- Botón **Detener**
+- Registro de progreso en vivo
+- Carpeta de salida configurable (por defecto `Downloads/YouTubeMusic`)
+
+### Formatos
+- **MP3 (compatible):** conversión a MP3 en máxima calidad (`--audio-quality 0`)
+- **Opus (tal cual YouTube):** el mejor audio de YouTube Music (Opus) sin reconvertir; solo se cambia el contenedor de `.webm` a `.opus` para poder embeber carátula/letra. Misma fidelidad de audio.
+
+### Nombre de archivo
+- `canción - artista.ext` (limpio, sin caracteres inválidos)
+
+### Un solo archivo por canción
+- Queda **solo** el `.mp3` o `.opus`
+- **Carátula** embebida dentro del archivo (iTunes → si no, miniatura de YouTube Music)
+- **Letra** embebida dentro del archivo (LRCLIB → si no, lyrics.ovh)
+- No genera `.jpg`, `.lrc` ni `.txt` al lado
+- Pensado para que AIMP muestre portada y letra desde el propio archivo
+
+### Evitar duplicados
+- Si la canción ya existe en la carpeta, no la vuelve a descargar
+- En el resumen: Descargadas / Ya estaban / Fallidos
+
+### Portapapeles
+- Opción para añadir automáticamente enlaces de YouTube / YouTube Music al copiarlos
+- Ignora duplicados y URLs que no sean de YouTube
+- No pega al abrir la app ni mientras descarga
+
+## Notas
+- Opus = máxima fidelidad posible desde YouTube Music (stream original). El techo lo pone YouTube, no la app.
+- MP3 es más compatible; Opus es mejor calidad de origen.
+- Si no hay letra en las fuentes usadas, el audio y la carátula igual se guardan; solo falta la letra (aviso en el log).
+- En YouTube Music del navegador, a veces hace falta un addon que reactive el clic derecho (p. ej. Allow Right Click) si la web lo bloquea.
+```
+
+
+
+
+###############

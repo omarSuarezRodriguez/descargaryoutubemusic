@@ -1,12 +1,11 @@
 """
-Extras de metadatos: carátula (álbum → miniatura YT) y letra (LRCLIB).
-No altera el audio descargado; solo sidecars / tags MP3.
+Extras de metadatos: carátula y letra embebidas en un solo archivo (MP3/Opus).
+Sin sidecars .jpg/.lrc/.txt.
 """
 
 from __future__ import annotations
 
 import json
-import re
 import subprocess
 import urllib.error
 import urllib.parse
@@ -16,7 +15,10 @@ from typing import Callable
 
 LogFn = Callable[[str], None]
 
-USER_AGENT = "descargaryoutubemusic/1.03 (local; +https://github.com/omarSuarezRodriguez/descargaryoutubemusic)"
+USER_AGENT = (
+    "descargaryoutubemusic/1.04 "
+    "(local; +https://github.com/omarSuarezRodriguez/descargaryoutubemusic)"
+)
 
 
 def _http_get(url: str, timeout: float = 20.0) -> bytes:
@@ -119,7 +121,6 @@ def fetch_itunes_cover_url(artist: str, track: str, album: str = "") -> str | No
         reverse=True,
     )
     if not ranked or score(ranked[0]) < 3:
-        # Intento con álbum si hay
         if album and artist:
             query2 = urllib.parse.urlencode(
                 {
@@ -140,12 +141,21 @@ def fetch_itunes_cover_url(artist: str, track: str, album: str = "") -> str | No
     return str(art).replace("100x100bb", "600x600bb")
 
 
-def fetch_lrclib_lyrics(artist: str, track: str, album: str = "", duration: float | None = None) -> tuple[str | None, str]:
-    """
-    Devuelve (texto, extensión_sugerida) donde extensión es 'lrc' o 'txt'.
-    """
+def _lyrics_from_lrclib_item(item: dict) -> str | None:
+    synced = (item.get("syncedLyrics") or "").strip()
+    plain = (item.get("plainLyrics") or "").strip()
+    if synced:
+        return synced
+    if plain:
+        return plain
+    return None
+
+
+def fetch_lrclib_lyrics(
+    artist: str, track: str, album: str = "", duration: float | None = None
+) -> str | None:
     if not artist or not track:
-        return None, "txt"
+        return None
 
     params: dict[str, str] = {
         "artist_name": artist,
@@ -156,51 +166,76 @@ def fetch_lrclib_lyrics(artist: str, track: str, album: str = "", duration: floa
     if duration and duration > 0:
         params["duration"] = str(int(round(duration)))
 
-    # 1) get exacto
     try:
         query = urllib.parse.urlencode(params)
         data = _http_get_json(f"https://lrclib.net/api/get?{query}")
         if isinstance(data, dict):
-            synced = (data.get("syncedLyrics") or "").strip()
-            plain = (data.get("plainLyrics") or "").strip()
-            if synced:
-                return synced, "lrc"
-            if plain:
-                return plain, "txt"
+            text = _lyrics_from_lrclib_item(data)
+            if text:
+                return text
     except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, json.JSONDecodeError):
         pass
 
-    # 2) search
+    for qparams in (
+        {"artist_name": artist, "track_name": track},
+        {"q": f"{artist} {track}"},
+    ):
+        try:
+            query = urllib.parse.urlencode(qparams)
+            data = _http_get_json(f"https://lrclib.net/api/search?{query}")
+            if isinstance(data, list):
+                for item in data:
+                    if not isinstance(item, dict):
+                        continue
+                    text = _lyrics_from_lrclib_item(item)
+                    if text:
+                        return text
+        except (
+            urllib.error.HTTPError,
+            urllib.error.URLError,
+            TimeoutError,
+            json.JSONDecodeError,
+        ):
+            continue
+
+    return None
+
+
+def fetch_lyrics_ovh(artist: str, track: str) -> str | None:
+    """Fallback simple y público."""
+    if not artist or not track:
+        return None
     try:
-        query = urllib.parse.urlencode(
-            {"artist_name": artist, "track_name": track}
-        )
-        data = _http_get_json(f"https://lrclib.net/api/search?{query}")
-        if isinstance(data, list) and data:
-            best = data[0]
-            if isinstance(best, dict):
-                synced = (best.get("syncedLyrics") or "").strip()
-                plain = (best.get("plainLyrics") or "").strip()
-                if synced:
-                    return synced, "lrc"
-                if plain:
-                    return plain, "txt"
+        a = urllib.parse.quote(artist)
+        t = urllib.parse.quote(track)
+        data = _http_get_json(f"https://api.lyrics.ovh/v1/{a}/{t}")
+        if isinstance(data, dict):
+            text = (data.get("lyrics") or "").strip()
+            if text:
+                return text
     except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, json.JSONDecodeError):
-        pass
+        return None
+    return None
 
-    return None, "txt"
+
+def fetch_lyrics(
+    artist: str, track: str, album: str = "", duration: float | None = None
+) -> tuple[str | None, str]:
+    """Cascada de letras. Devuelve (texto, fuente)."""
+    text = fetch_lrclib_lyrics(artist, track, album, duration)
+    if text:
+        return text, "lrclib"
+    text = fetch_lyrics_ovh(artist, track)
+    if text:
+        return text, "lyrics.ovh"
+    return None, "none"
 
 
 def _to_jpeg_bytes(data: bytes, ffmpeg: Path | None) -> bytes | None:
     if data.startswith(b"\xff\xd8\xff"):
         return data
-    if data.startswith(b"\x89PNG"):
-        # PNG sirve para embeber; para sidecar .jpg convertimos si hay ffmpeg
-        if not ffmpeg:
-            return data
     if not ffmpeg:
-        # WebP u otros sin conversor: devolver raw (sidecar puede no ser .jpg real)
-        return data
+        return data if data.startswith(b"\x89PNG") else None
 
     import tempfile
 
@@ -239,11 +274,7 @@ def download_cover_image(
     ffmpeg: Path | None,
     log: LogFn,
 ) -> tuple[bytes | None, str]:
-    """
-    Cascada: carátula iTunes → miniatura YouTube Music.
-    Devuelve (bytes_imagen, fuente).
-    """
-    # 1) Oficial / catálogo
+    """Cascada: carátula iTunes → miniatura YouTube Music."""
     try:
         cover_url = fetch_itunes_cover_url(artist, track, album)
         if cover_url:
@@ -255,7 +286,6 @@ def download_cover_image(
     except Exception as exc:  # noqa: BLE001
         log(f"Carátula iTunes no disponible ({exc.__class__.__name__})")
 
-    # 2) Miniatura YouTube Music
     try:
         thumb = youtube_thumbnail_url(info)
         if thumb:
@@ -309,18 +339,134 @@ def embed_mp3_metadata(
         )
 
     if lyrics:
+        # AIMP: LRC con timestamps dentro de USLT
         tags.delall("USLT")
         tags.add(
             USLT(
                 encoding=Encoding.UTF8,
-                lang="spa",
+                lang="eng",
                 desc="Lyrics",
-                text=re.sub(r"\[\d{1,2}:\d{2}(?:\.\d{1,3})?\]", "", lyrics).strip()
-                or lyrics,
+                text=lyrics,
             )
         )
 
     tags.save(mp3_path, v2_version=3)
+
+
+def embed_opus_metadata(
+    opus_path: Path,
+    cover_bytes: bytes | None,
+    lyrics: str | None,
+    artist: str,
+    track: str,
+    album: str,
+) -> None:
+    """Embebe tags + carátula en .opus (Ogg Opus) para AIMP y similares."""
+    import base64
+
+    from mutagen.flac import Picture
+    from mutagen.oggopus import OggOpus
+
+    audio = OggOpus(opus_path)
+    if track:
+        audio["title"] = [track]
+    if artist:
+        audio["artist"] = [artist]
+    if album:
+        audio["album"] = [album]
+
+    if lyrics:
+        audio["lyrics"] = [lyrics]
+        audio["unsyncedlyrics"] = [lyrics]
+
+    if cover_bytes:
+        pic = Picture()
+        pic.data = cover_bytes
+        pic.type = 3
+        pic.mime = (
+            "image/png" if cover_bytes.startswith(b"\x89PNG") else "image/jpeg"
+        )
+        pic.desc = "Cover"
+        encoded = base64.b64encode(pic.write()).decode("ascii")
+        audio["metadata_block_picture"] = [encoded]
+
+    audio.save()
+
+
+def verify_embedded_cover(audio_path: Path) -> bool:
+    suffix = audio_path.suffix.lower()
+    try:
+        if suffix == ".mp3":
+            from mutagen.id3 import ID3
+
+            tags = ID3(audio_path)
+            return any(str(k).startswith("APIC") for k in tags.keys())
+        if suffix == ".opus":
+            from mutagen.oggopus import OggOpus
+
+            tags = OggOpus(audio_path)
+            return bool(tags.get("metadata_block_picture"))
+    except Exception:
+        return False
+    return False
+
+
+def verify_embedded_lyrics(audio_path: Path) -> bool:
+    suffix = audio_path.suffix.lower()
+    try:
+        if suffix == ".mp3":
+            from mutagen.id3 import ID3
+
+            tags = ID3(audio_path)
+            return any(str(k).startswith("USLT") for k in tags.keys())
+        if suffix == ".opus":
+            from mutagen.oggopus import OggOpus
+
+            tags = OggOpus(audio_path)
+            return bool(tags.get("lyrics") or tags.get("unsyncedlyrics"))
+    except Exception:
+        return False
+    return False
+
+
+def remux_to_opus(audio_path: Path, ffmpeg: Path, log: LogFn) -> Path:
+    """Remuxa a .opus sin re-encodear el audio (misma fidelidad)."""
+    if audio_path.suffix.lower() == ".opus":
+        return audio_path
+    if not ffmpeg or not ffmpeg.is_file():
+        raise RuntimeError("ffmpeg no disponible para remux a .opus")
+
+    out_path = audio_path.with_suffix(".opus")
+    if out_path.exists():
+        out_path.unlink()
+
+    proc = subprocess.run(
+        [
+            str(ffmpeg),
+            "-y",
+            "-i",
+            str(audio_path),
+            "-vn",
+            "-c:a",
+            "copy",
+            str(out_path),
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    if proc.returncode != 0 or not out_path.is_file():
+        detail = (proc.stderr or proc.stdout or "")[-300:]
+        raise RuntimeError(f"remux opus falló: {detail}")
+
+    try:
+        audio_path.unlink()
+    except OSError:
+        pass
+    log(f"Contenedor: {audio_path.suffix} -> .opus (sin reconvertir audio)")
+    return out_path
 
 
 def attach_lyrics_and_cover(
@@ -329,8 +475,11 @@ def attach_lyrics_and_cover(
     info: dict,
     ffmpeg: Path | None,
     log: LogFn,
-) -> None:
-    """Guarda sidecars y embebe en MP3. Nunca lanza al llamador."""
+) -> Path:
+    """
+    Embebe carátula y letra en el audio. Siempre 1 archivo (sin sidecars).
+    Devuelve la ruta final del audio (puede cambiar .webm -> .opus).
+    """
     try:
         artist = meta_artist(info)
         track = meta_track(info)
@@ -341,49 +490,71 @@ def attach_lyrics_and_cover(
         except (TypeError, ValueError):
             duration_f = None
 
-        out_dir = audio_path.parent
-        cover_path = out_dir / f"{basename}.jpg"
+        suffix = audio_path.suffix.lower()
+        if suffix in {".webm", ".mka", ".mkv"} and ffmpeg:
+            try:
+                audio_path = remux_to_opus(audio_path, ffmpeg, log)
+            except Exception as exc:  # noqa: BLE001
+                log(f"AVISO: no se pudo pasar a .opus ({exc})")
 
         cover_bytes, _source = download_cover_image(
             artist, track, album, info, ffmpeg, log
         )
-        if cover_bytes:
-            # Preferir JPEG en disco
-            if cover_bytes.startswith(b"\xff\xd8\xff"):
-                cover_path.write_bytes(cover_bytes)
-                log(f"Carátula guardada: {cover_path.name}")
-            elif cover_bytes.startswith(b"\x89PNG"):
-                png_path = out_dir / f"{basename}.png"
-                png_path.write_bytes(cover_bytes)
-                log(f"Carátula guardada: {png_path.name}")
-                cover_path = png_path
-            else:
-                cover_path.write_bytes(cover_bytes)
-                log(f"Carátula guardada: {cover_path.name}")
-        else:
+        if not cover_bytes:
             log("AVISO: no se encontró carátula (ni iTunes ni miniatura YT)")
 
-        lyrics, ext = fetch_lrclib_lyrics(artist, track, album, duration_f)
-        lyrics_path = None
+        lyrics, lyrics_source = fetch_lyrics(artist, track, album, duration_f)
         if lyrics:
-            lyrics_path = out_dir / f"{basename}.{ext}"
-            lyrics_path.write_text(lyrics, encoding="utf-8")
-            log(f"Letra guardada: {lyrics_path.name}")
+            log(f"Letra: {lyrics_source}")
         else:
             log("AVISO: no se encontró letra")
 
-        if audio_path.suffix.lower() == ".mp3":
+        suffix = audio_path.suffix.lower()
+        if suffix == ".mp3":
             try:
                 embed_mp3_metadata(
-                    audio_path,
-                    cover_bytes,
-                    lyrics,
-                    artist,
-                    track,
-                    album,
+                    audio_path, cover_bytes, lyrics, artist, track, album
                 )
-                log("Metadatos embebidos en MP3 (carátula/letra si había)")
             except Exception as exc:  # noqa: BLE001
                 log(f"AVISO: no se pudo embeber en MP3 ({exc})")
+        elif suffix == ".opus":
+            try:
+                embed_opus_metadata(
+                    audio_path, cover_bytes, lyrics, artist, track, album
+                )
+            except Exception as exc:  # noqa: BLE001
+                log(f"AVISO: no se pudo embeber en Opus ({exc})")
+        else:
+            log(f"AVISO: formato {suffix} sin embeber nativo de carátula/letra")
+
+        if cover_bytes:
+            if verify_embedded_cover(audio_path):
+                log("Carátula embebida OK (sin archivo .jpg)")
+            else:
+                log("AVISO: carátula no quedó embebida")
+        if lyrics:
+            if verify_embedded_lyrics(audio_path):
+                log("Letra embebida OK (sin archivo .lrc/.txt)")
+            else:
+                log("AVISO: letra no quedó embebida")
+
+        # Limpiar sidecars de versiones anteriores
+        out_dir = audio_path.parent
+        for extra in (
+            out_dir / f"{basename}.jpg",
+            out_dir / f"{basename}.png",
+            out_dir / f"{basename}.lrc",
+            out_dir / f"{basename}.txt",
+            out_dir / f"{basename}.webp",
+        ):
+            if extra.is_file():
+                try:
+                    extra.unlink()
+                    log(f"Eliminado sidecar: {extra.name}")
+                except OSError:
+                    pass
+
+        log(f"1 archivo listo: {audio_path.name}")
     except Exception as exc:  # noqa: BLE001
         log(f"AVISO: extras de letra/carátula fallaron ({exc})")
+    return audio_path

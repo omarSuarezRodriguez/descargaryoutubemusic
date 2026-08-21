@@ -149,7 +149,7 @@ def build_download_cmd(
     ffmpeg: Path | None,
     basename: str,
 ) -> list[str]:
-    """Arma el comando yt-dlp según MP3 (convertir) o WebM (tal cual)."""
+    """Arma el comando yt-dlp según MP3 (convertir) u Opus/WebM (tal cual)."""
     cmd = [
         *base_cmd,
         "-f",
@@ -158,8 +158,8 @@ def build_download_cmd(
         str(out_dir / f"{basename}.%(ext)s"),
         "--no-playlist",
     ]
-    if format_mode == "webm":
-        # Audio original de YouTube (casi siempre Opus en .webm) = máxima fidelidad posible
+    # opus/webm: audio original de YouTube (luego se remuxa a .opus para carátula)
+    if format_mode in {"opus", "webm"}:
         pass
     else:
         # MP3 máxima calidad VBR
@@ -254,9 +254,9 @@ class App(tk.Tk):
         ).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Radiobutton(
             format_row,
-            text="WebM (tal cual YouTube)",
+            text="Opus (tal cual YouTube)",
             variable=self.format_mode,
-            value="webm",
+            value="opus",
         ).pack(side=tk.LEFT, padx=(12, 0))
 
         folder_row = ttk.Frame(root)
@@ -348,8 +348,7 @@ class App(tk.Tk):
             self._log(f"ffmpeg: {self._ffmpeg}")
         else:
             self._log(
-                "AVISO: no se encontró ffmpeg. Hace falta para convertir a MP3.\n"
-                "El modo WebM (tal cual) funciona sin ffmpeg.\n"
+                "AVISO: no se encontró ffmpeg. Hace falta para MP3 y para Opus.\n"
                 "Instálalo (winget install Gyan.FFmpeg) o agrégalo al PATH."
             )
 
@@ -397,13 +396,17 @@ class App(tk.Tk):
         self.progress.configure(maximum=len(urls), value=0)
         self._set_busy(True)
         mode = self.format_mode.get()
-        mode_label = "MP3 (compatible)" if mode == "mp3" else "WebM (tal cual YouTube)"
-        if mode == "mp3" and not self._ffmpeg:
+        mode_label = (
+            "MP3 (compatible)"
+            if mode == "mp3"
+            else "Opus (tal cual YouTube, máxima fidelidad)"
+        )
+        if mode in {"mp3", "opus", "webm"} and not self._ffmpeg:
             messagebox.showwarning(
                 "Falta ffmpeg",
                 "No se encontró ffmpeg.\n\n"
-                "Sin ffmpeg no se puede convertir a MP3.\n"
-                "Usa el modo WebM o instala: winget install Gyan.FFmpeg",
+                "Hace falta para MP3 y para Opus (remux + carátula).\n"
+                "Instala con: winget install Gyan.FFmpeg",
             )
             self._set_busy(False)
             return
@@ -411,7 +414,7 @@ class App(tk.Tk):
         self._log(f"Formato: {mode_label}")
         self._log(f"Carpeta: {out_dir}")
         self._log("Nombre: canción - artista")
-        self._log("Extras: letra + carátula (álbum → miniatura YT)")
+        self._log("Extras: carátula + letra embebidas (1 solo archivo)")
 
         self._worker = threading.Thread(
             target=self._download_all,
