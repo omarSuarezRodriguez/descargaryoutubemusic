@@ -206,7 +206,7 @@ class App(tk.Tk):
         self.minsize(560, 420)
 
         self.download_dir = tk.StringVar(
-            value=str(Path.home() / "Downloads" / "YouTubeMusic")
+            value=str(Path.home() / "Downloads" / "YouTubeMusic" / "Canciones")
         )
         self._log_queue: queue.Queue[str] = queue.Queue()
         self._worker: threading.Thread | None = None
