@@ -1,6 +1,4 @@
-## v1.02
-
-
+## v1.04
 
 
 
@@ -11,14 +9,8 @@ La app funciona usando el desbloqueador de clic derecho de las webs, addon, llam
 Re-enable right-click on websites that overwrite it
 
 
-
-
-
-
-
 #####################################
 ## v1.02
-
 
 Qué añadí
 Selector circular en la app:
@@ -35,8 +27,9 @@ MP3
 ~6.5 MB
 
 
-
-
-
 #############################
+## v1.04
 
+
+
+Todo quedó funcionando correctamente 

@@ -1,10 +1,11 @@
 """
 Descargador de audio desde YouTube Music / YouTube.
-Pega varios enlaces (uno por línea) y descarga MP3 en orden.
+Pega varios enlaces (uno por línea) y descarga MP3 o WebM en orden.
 """
 
 from __future__ import annotations
 
+import json
 import queue
 import re
 import subprocess
@@ -13,6 +14,8 @@ import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
+
+AUDIO_EXTENSIONS = {".mp3", ".webm", ".m4a", ".opus", ".ogg", ".flac", ".wav", ".aac"}
 
 
 def find_yt_dlp() -> list[str]:
@@ -39,7 +42,11 @@ def find_ffmpeg() -> Path | None:
 
     local = Path.home() / "AppData" / "Local" / "Microsoft" / "WinGet" / "Packages"
     if local.is_dir():
-        matches = sorted(local.glob("**/ffmpeg.exe"), key=lambda p: p.stat().st_mtime, reverse=True)
+        matches = sorted(
+            local.glob("**/ffmpeg.exe"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
         if matches:
             return matches[0].resolve()
 
@@ -54,12 +61,91 @@ def find_ffmpeg() -> Path | None:
     return None
 
 
+def clean_filename(name: str) -> str:
+    """Quita caracteres inválidos en Windows y deja el nombre limpio."""
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", name)
+    name = name.replace("\u200b", "")
+    name = re.sub(r"\s+", " ", name).strip(" .")
+    return name or "audio"
+
+
+def song_artist_basename(info: dict) -> str:
+    """Nombre limpio: 'canción - artista'."""
+    track = (info.get("track") or "").strip()
+    artist = (
+        info.get("artist")
+        or info.get("album_artist")
+        or info.get("creator")
+        or ""
+    )
+    if isinstance(artist, list):
+        artist = ", ".join(str(a) for a in artist if a)
+    artist = str(artist).strip()
+    title = (info.get("title") or "").strip()
+
+    if track and artist:
+        return clean_filename(f"{track} - {artist}")
+
+    if artist and title:
+        song = title
+        prefix = f"{artist} - "
+        if title.casefold().startswith(prefix.casefold()):
+            song = title[len(prefix) :].strip()
+        return clean_filename(f"{song} - {artist}")
+
+    # Título típico de YT Music: "Artista - Canción"
+    if " - " in title:
+        left, right = title.split(" - ", 1)
+        return clean_filename(f"{right.strip()} - {left.strip()}")
+
+    return clean_filename(title or track or "audio")
+
+
+def find_existing_download(out_dir: Path, basename: str) -> Path | None:
+    """Busca si ya hay un archivo con ese nombre (cualquier extensión de audio)."""
+    if not out_dir.is_dir():
+        return None
+    target = basename.casefold()
+    for path in out_dir.iterdir():
+        if (
+            path.is_file()
+            and path.suffix.lower() in AUDIO_EXTENSIONS
+            and path.stem.casefold() == target
+        ):
+            return path
+    return None
+
+
+def fetch_video_info(base_cmd: list[str], url: str) -> dict:
+    """Obtiene metadatos sin descargar."""
+    cmd = [
+        *base_cmd,
+        "--skip-download",
+        "--no-playlist",
+        "-J",
+        url,
+    ]
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(detail[-500:] or f"código {result.returncode}")
+    return json.loads(result.stdout)
+
+
 def build_download_cmd(
     base_cmd: list[str],
     url: str,
     out_dir: Path,
     format_mode: str,
     ffmpeg: Path | None,
+    basename: str,
 ) -> list[str]:
     """Arma el comando yt-dlp según MP3 (convertir) o WebM (tal cual)."""
     cmd = [
@@ -67,11 +153,11 @@ def build_download_cmd(
         "-f",
         "bestaudio",
         "-o",
-        str(out_dir / "%(title)s.%(ext)s"),
+        str(out_dir / f"{basename}.%(ext)s"),
         "--no-playlist",
     ]
     if format_mode == "webm":
-        # Audio original de YouTube (casi siempre Opus en .webm)
+        # Audio original de YouTube (casi siempre Opus en .webm) = máxima fidelidad posible
         pass
     else:
         # MP3 máxima calidad VBR
@@ -113,7 +199,7 @@ def parse_urls(text: str) -> list[str]:
 class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("Descargar YouTube Music (MP3)")
+        self.title("Descargar YouTube Music")
         self.geometry("720x560")
         self.minsize(560, 420)
 
@@ -322,6 +408,7 @@ class App(tk.Tk):
         self._log(f"Iniciando descarga de {len(urls)} enlace(s)…")
         self._log(f"Formato: {mode_label}")
         self._log(f"Carpeta: {out_dir}")
+        self._log("Nombre: canción - artista")
 
         self._worker = threading.Thread(
             target=self._download_all,
@@ -337,6 +424,7 @@ class App(tk.Tk):
     def _download_all(self, urls: list[str], out_dir: Path, format_mode: str) -> None:
         base_cmd = find_yt_dlp()
         ok = 0
+        skipped = 0
         fail = 0
 
         for index, url in enumerate(urls, start=1):
@@ -345,11 +433,21 @@ class App(tk.Tk):
                 break
 
             self._log(f"\n[{index}/{len(urls)}] {url}")
-            cmd = build_download_cmd(
-                base_cmd, url, out_dir, format_mode, self._ffmpeg
-            )
-
             try:
+                info = fetch_video_info(base_cmd, url)
+                basename = song_artist_basename(info)
+                self._log(f"Nombre: {basename}")
+
+                existing = find_existing_download(out_dir, basename)
+                if existing:
+                    skipped += 1
+                    self._log(f"⊘ Ya estaba descargada: {existing.name}")
+                    self.after(0, lambda v=index: self.progress.configure(value=v))
+                    continue
+
+                cmd = build_download_cmd(
+                    base_cmd, url, out_dir, format_mode, self._ffmpeg, basename
+                )
                 process = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
@@ -395,14 +493,19 @@ class App(tk.Tk):
 
             self.after(0, lambda v=index: self.progress.configure(value=v))
 
-        self._log(f"\nListo. OK: {ok} | Fallidos: {fail}")
+        self._log(
+            f"\nListo. Descargadas: {ok} | Ya estaban: {skipped} | Fallidos: {fail}"
+        )
         self.after(0, lambda: self._set_busy(False))
-        if ok and not self._stop_flag.is_set():
+        if (ok or skipped) and not self._stop_flag.is_set():
             self.after(
                 0,
                 lambda: messagebox.showinfo(
                     "Descarga terminada",
-                    f"Se descargaron {ok} archivo(s).\nFallidos: {fail}\n\nCarpeta:\n{out_dir}",
+                    f"Descargadas: {ok}\n"
+                    f"Ya estaban descargadas: {skipped}\n"
+                    f"Fallidos: {fail}\n\n"
+                    f"Carpeta:\n{out_dir}",
                 ),
             )
 
