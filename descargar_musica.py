@@ -15,6 +15,8 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
+from metadata_extras import attach_lyrics_and_cover
+
 AUDIO_EXTENSIONS = {".mp3", ".webm", ".m4a", ".opus", ".ogg", ".flac", ".wav", ".aac"}
 
 
@@ -409,6 +411,7 @@ class App(tk.Tk):
         self._log(f"Formato: {mode_label}")
         self._log(f"Carpeta: {out_dir}")
         self._log("Nombre: canción - artista")
+        self._log("Extras: letra + carátula (álbum → miniatura YT)")
 
         self._worker = threading.Thread(
             target=self._download_all,
@@ -477,6 +480,19 @@ class App(tk.Tk):
                 if code == 0:
                     ok += 1
                     self._log(f"✓ Completado ({index}/{len(urls)})")
+                    audio_path = find_existing_download(out_dir, basename)
+                    if audio_path:
+                        attach_lyrics_and_cover(
+                            audio_path,
+                            basename,
+                            info,
+                            self._ffmpeg,
+                            self._log,
+                        )
+                    else:
+                        self._log(
+                            "AVISO: audio OK pero no se encontró el archivo para extras"
+                        )
                 else:
                     fail += 1
                     self._log(f"✗ Error (código {code}) en {url}")
