@@ -7,11 +7,14 @@ Hasta 2 descargas en paralelo (misma calidad; solo velocidad).
 from __future__ import annotations
 
 import json
+import hashlib
 import queue
 import re
+import shutil
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -25,6 +28,8 @@ from link_catalog import LinkCatalog, refresh_link_catalog_window, show_link_cat
 AUDIO_EXTENSIONS = {".mp3", ".webm", ".m4a", ".opus", ".ogg", ".flac", ".wav", ".aac"}
 # Solo velocidad: 2 pistas a la vez (no afecta calidad/formato)
 PARALLEL_DOWNLOADS = 2
+ID_NAME_CACHE = ".yt_id_names.json"
+STAGING_DIRNAME = ".staging"
 
 
 def find_yt_dlp() -> list[str]:
@@ -39,6 +44,32 @@ def find_yt_dlp() -> list[str]:
 
     # Fallback: ejecutable en PATH
     return ["yt-dlp"]
+
+
+def yt_dlp_js_runtime_args() -> list[str]:
+    """
+    Runtime JS para extracción YouTube (yt-dlp EJS).
+    No cambia calidad/formato; solo fiabilidad al listar/descargar.
+    """
+    from shutil import which
+
+    if which("node"):
+        return ["--js-runtimes", "node"]
+    return []
+
+
+def is_transient_yt_block(text: str) -> bool:
+    """True si el fallo parece bloqueo temporal de YouTube (bot/rate), no formato."""
+    t = (text or "").lower()
+    needles = (
+        "cookies",
+        "sign in to confirm",
+        "not a bot",
+        "http error 429",
+        "too many requests",
+        "please confirm that you are not a bot",
+    )
+    return any(n in t for n in needles)
 
 
 def find_ffmpeg() -> Path | None:
@@ -192,6 +223,7 @@ def fetch_video_info(base_cmd: list[str], url: str) -> dict:
     """Obtiene metadatos sin descargar (solo usos puntuales, p. ej. enriquecer álbum)."""
     cmd = [
         *base_cmd,
+        *yt_dlp_js_runtime_args(),
         "--skip-download",
         "--no-playlist",
         "-J",
@@ -244,6 +276,7 @@ def build_download_cmd(
 
     cmd = [
         *base_cmd,
+        *yt_dlp_js_runtime_args(),
         "-f",
         "bestaudio",
         "-N",
@@ -323,6 +356,59 @@ def cleanup_staging_id(staging_dir: Path, video_id: str | None) -> None:
                 path.unlink()
             except OSError:
                 pass
+    remove_staging_if_empty(staging_dir)
+
+
+def remove_staging_if_empty(staging_dir: Path) -> None:
+    """Borra la carpeta staging si quedó vacía."""
+    if not staging_dir.is_dir():
+        return
+    try:
+        if any(staging_dir.iterdir()):
+            return
+        staging_dir.rmdir()
+    except OSError:
+        pass
+
+
+def scrub_delivery_artifacts(folder: Path) -> None:
+    """
+    Quita residuos internos de carpetas de entrega (.yt_id_names.json, .staging).
+    No toca audio ni metadatos embebidos.
+    """
+    if not folder.is_dir():
+        return
+    legacy_cache = folder / ID_NAME_CACHE
+    if legacy_cache.is_file():
+        try:
+            legacy_cache.unlink()
+        except OSError:
+            pass
+    legacy_staging = folder / STAGING_DIRNAME
+    if legacy_staging.is_dir():
+        try:
+            shutil.rmtree(legacy_staging, ignore_errors=True)
+        except OSError:
+            pass
+
+
+def _path_key(path: Path) -> str:
+    try:
+        raw = str(path.resolve())
+    except OSError:
+        raw = str(path)
+    return hashlib.sha1(raw.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def get_staging_dir(parent: Path) -> Path:
+    """
+    Staging fuera de la carpeta de música (.download_queue/staging/...).
+    Así las carpetas de canciones no acumulan .staging.
+    """
+    queue_dir = dlstate.ensure_queue_dir()
+    staging = queue_dir / "staging" / _path_key(parent)
+    staging.mkdir(parents=True, exist_ok=True)
+    return staging
 
 
 def promote_staged_to_dest(
@@ -350,24 +436,45 @@ def promote_staged_to_dest(
         return "ok", final_path, basename
     finally:
         cleanup_staging_id(staging_dir, video_id)
-
-
-ID_NAME_CACHE = ".yt_id_names.json"
+        scrub_delivery_artifacts(dest_dir)
 
 
 def _cache_path(base_dir: Path) -> Path:
+    """Caché id→nombre en .download_queue (no junto a las canciones)."""
+    queue_dir = dlstate.ensure_queue_dir()
+    cache_root = queue_dir / "yt_id_names"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    return cache_root / f"{_path_key(base_dir)}.json"
+
+
+def _legacy_cache_path(base_dir: Path) -> Path:
     return base_dir / ID_NAME_CACHE
 
 
 def load_id_name_cache(base_dir: Path) -> dict[str, dict[str, str]]:
     path = _cache_path(base_dir)
-    if not path.is_file():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
+    if path.is_file():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+    # Migrar caché antigua que vivía en la carpeta de música
+    legacy = _legacy_cache_path(base_dir)
+    if legacy.is_file():
+        try:
+            data = json.loads(legacy.read_text(encoding="utf-8", errors="replace"))
+            if isinstance(data, dict):
+                save_id_name_cache(base_dir, data)
+                try:
+                    legacy.unlink()
+                except OSError:
+                    pass
+                return data
+        except Exception:
+            pass
+    return {}
 
 
 def save_id_name_cache(base_dir: Path, cache: dict[str, dict[str, str]]) -> None:
@@ -378,6 +485,8 @@ def save_id_name_cache(base_dir: Path, cache: dict[str, dict[str, str]]) -> None
         )
     except OSError:
         pass
+    # Por si quedó el archivo viejo junto a las canciones
+    scrub_delivery_artifacts(base_dir)
 
 
 def cache_lookup_existing(
@@ -483,6 +592,8 @@ class App(tk.Tk):
         self._active_batch_id: str | None = None
         self._poll_after_id: str | None = None
         self._log_offset = 0
+        self._event_lines: list[str] = []
+        self._registry_text: str | None = None
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -496,10 +607,27 @@ class App(tk.Tk):
         root = ttk.Frame(self, padding=12)
         root.pack(fill=tk.BOTH, expand=True)
 
+        style = ttk.Style(self)
+        style.configure(
+            "Speed.TLabel",
+            foreground="#1a7f37",
+            font=("Segoe UI", 11, "bold"),
+        )
+
+        header = ttk.Frame(root)
+        header.pack(fill=tk.X, **pad)
         ttk.Label(
-            root,
+            header,
             text="Enlaces (uno por línea). Si copias un enlace, se añade solo:",
-        ).pack(anchor=tk.W, **pad)
+        ).pack(side=tk.LEFT, anchor=tk.W)
+        self.lbl_speed = ttk.Label(
+            header,
+            text="",
+            style="Speed.TLabel",
+            anchor=tk.E,
+            width=14,
+        )
+        self.lbl_speed.pack(side=tk.RIGHT, anchor=tk.E)
 
         self.txt_urls = scrolledtext.ScrolledText(root, height=12, wrap=tk.WORD)
         self.txt_urls.pack(fill=tk.BOTH, expand=True, **pad)
@@ -555,6 +683,11 @@ class App(tk.Tk):
         self.progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(12, 8))
         self.progress_pct = ttk.Label(btn_row, text="0%", width=5, anchor=tk.E)
         self.progress_pct.pack(side=tk.LEFT)
+
+        eta_row = ttk.Frame(root)
+        eta_row.pack(fill=tk.X, padx=12, pady=(0, 4))
+        self.lbl_eta = ttk.Label(eta_row, text="", anchor=tk.E)
+        self.lbl_eta.pack(side=tk.RIGHT)
 
         ttk.Label(root, text="Registro:").pack(anchor=tk.W, padx=12, pady=(8, 0))
         self.txt_log = scrolledtext.ScrolledText(
@@ -632,17 +765,141 @@ class App(tk.Tk):
     def _log(self, message: str) -> None:
         self._log_queue.put(message)
 
+    def _clear_download_log(self) -> None:
+        """Reinicia Registro mínimo."""
+        self._event_lines = []
+        self._registry_text = None
+        self._log_offset = len(dlstate.read_worker_log_tail(10_000))
+        self.txt_log.configure(state=tk.NORMAL)
+        self.txt_log.delete("1.0", tk.END)
+        self.txt_log.configure(state=tk.DISABLED)
+
     def _drain_log_queue(self) -> None:
+        """Mensajes puntuales (cancelar/error) → eventos o líneas sueltas."""
+        new_parts: list[str] = []
         while True:
             try:
                 message = self._log_queue.get_nowait()
             except queue.Empty:
                 break
-            self.txt_log.configure(state=tk.NORMAL)
-            self.txt_log.insert(tk.END, message + "\n")
-            self.txt_log.see(tk.END)
-            self.txt_log.configure(state=tk.DISABLED)
+            for part in str(message).splitlines():
+                part = part.strip()
+                if part:
+                    new_parts.append(part)
+        if new_parts:
+            if self._busy:
+                self._event_lines.extend(new_parts)
+                self._event_lines = self._event_lines[-40:]
+                try:
+                    live = dlstate.read_live_progress()
+                except Exception:
+                    live = []
+                self._rebuild_registry(
+                    live,
+                    finished=getattr(self, "_last_finished", 0),
+                    total=getattr(self, "_last_total", 1),
+                    active=True,
+                )
+            else:
+                self.txt_log.configure(state=tk.NORMAL)
+                for part in new_parts:
+                    self.txt_log.insert(tk.END, part + "\n")
+                self.txt_log.see(tk.END)
+                self.txt_log.configure(state=tk.DISABLED)
         self.after(100, self._drain_log_queue)
+
+    def _ingest_worker_events(self) -> None:
+        """Incorpora solo eventos útiles del worker (✓/⊘/✗)."""
+        try:
+            tail = dlstate.read_worker_log_tail(10_000)
+        except Exception:
+            return
+        if len(tail) < self._log_offset:
+            self._log_offset = 0
+        for line in tail[self._log_offset :]:
+            ev = dlstate.summarize_worker_event(line)
+            if ev:
+                self._event_lines.append(ev)
+        self._log_offset = len(tail)
+        if len(self._event_lines) > 40:
+            self._event_lines = self._event_lines[-40:]
+
+    def _set_total_speed(self, live: list | None) -> None:
+        """Velocidad total actual (suma) arriba a la derecha, en verde."""
+        if not hasattr(self, "lbl_speed"):
+            return
+        bps = dlstate.total_live_speed_bps(live or [])
+        if bps is None:
+            self.lbl_speed.configure(text="")
+        else:
+            self.lbl_speed.configure(text=dlstate.format_speed_bps(bps))
+
+    def _set_eta(
+        self,
+        *,
+        finished: int,
+        total: int,
+        live: list | None,
+        active: bool,
+    ) -> None:
+        """Tiempo estimado bajo la barra de progreso."""
+        if not hasattr(self, "lbl_eta"):
+            return
+        if not active:
+            self.lbl_eta.configure(text="")
+            return
+        if getattr(self, "_eta_anchor_progress", None) is None:
+            self._eta_anchor_progress = dlstate.batch_progress_fraction(
+                finished=finished,
+                total=total,
+                live_entries=live or [],
+            )
+            self._batch_started_at = time.time()
+            self.lbl_eta.configure(text="")
+            return
+        secs = dlstate.estimate_batch_eta_seconds(
+            finished=finished,
+            total=total,
+            live_entries=live or [],
+            started_at=getattr(self, "_batch_started_at", None),
+            baseline_progress=float(self._eta_anchor_progress or 0.0),
+        )
+        self.lbl_eta.configure(text=dlstate.format_eta_seconds(secs))
+
+    def _reset_eta_clock(self, *, resume: bool = False) -> None:
+        """Reinicia el reloj ETA (inicio nuevo o reenganche a cola)."""
+        self._batch_started_at = time.time()
+        self._eta_anchor_progress = None if resume else 0.0
+        if hasattr(self, "lbl_eta"):
+            self.lbl_eta.configure(text="")
+
+    def _rebuild_registry(
+        self,
+        live: list | None,
+        *,
+        finished: int,
+        total: int,
+        active: bool,
+        summary: str | None = None,
+    ) -> None:
+        """Reescribe el Text completo (evita el bug de concatenar con tags)."""
+        text = dlstate.build_minimal_registry_text(
+            finished=finished,
+            total=total,
+            events=self._event_lines,
+            live_entries=live or [],
+            summary=summary,
+            active=active,
+        )
+        if self._registry_text == text:
+            return
+        self._registry_text = text
+        self.txt_log.configure(state=tk.NORMAL)
+        self.txt_log.delete("1.0", tk.END)
+        if text:
+            self.txt_log.insert("1.0", text)
+        self.txt_log.see(tk.END)
+        self.txt_log.configure(state=tk.DISABLED)
 
     def _set_progress(self, value: int | float, maximum: int | float = 1) -> None:
         """Actualiza barra + porcentaje (elegante, ancho fijo)."""
@@ -735,10 +992,8 @@ class App(tk.Tk):
         if active > 0 and not running:
             dlstate.ensure_worker_running()
         self._set_busy(True)
-        self._log(
-            f"Estado recuperado: {active} en cola/ejecución. "
-            "Las descargas continúan en segundo plano."
-        )
+        self._clear_download_log()
+        self._reset_eta_clock(resume=True)
         self._start_status_poll()
 
     def _start_status_poll(self) -> None:
@@ -775,21 +1030,30 @@ class App(tk.Tk):
                 self._set_progress(finished, total)
                 active = int(snap.get("active", 0))
 
-            tail = snap.get("log_tail") or []
-            if len(tail) > self._log_offset:
-                for line in tail[self._log_offset :]:
-                    self._log(line)
-                self._log_offset = len(tail)
-
-            if active <= 0 and not (
+            self._last_finished = finished
+            self._last_total = total
+            self._ingest_worker_events()
+            live = snap.get("live_progress") or []
+            still_busy = active > 0 or bool(
                 self._worker and self._worker.is_alive()
-            ):
+            )
+
+            if not still_busy:
                 ok = int(counts.get(dlstate.STATUS_DONE, 0))
                 skipped = int(counts.get(dlstate.STATUS_SKIPPED, 0))
                 fail = int(counts.get(dlstate.STATUS_FAILED, 0))
-                self._log(
-                    f"\nListo. Descargadas: {ok} | Ya estaban: {skipped} | Fallidos: {fail}"
+                summary = (
+                    f"Listo. Descargadas: {ok} | Ya estaban: {skipped} | Fallidos: {fail}"
                 )
+                self._rebuild_registry(
+                    [],
+                    finished=finished,
+                    total=total,
+                    active=False,
+                    summary=summary,
+                )
+                self._set_total_speed([])
+                self._set_eta(finished=finished, total=total, live=[], active=False)
                 self._set_busy(False)
                 self._poll_after_id = None
                 self._active_batch_id = None
@@ -806,9 +1070,17 @@ class App(tk.Tk):
                         ),
                     )
                 return
+
+            self._rebuild_registry(
+                live, finished=finished, total=total, active=True
+            )
+            self._set_total_speed(live)
+            self._set_eta(
+                finished=finished, total=total, live=live, active=True
+            )
         except Exception as exc:  # noqa: BLE001
             self._log(f"AVISO poll: {exc}")
-        self._poll_after_id = self.after(800, self._poll_status_tick)
+        self._poll_after_id = self.after(500, self._poll_status_tick)
 
     def _start_download(self) -> None:
         if self._is_downloading():
@@ -834,11 +1106,6 @@ class App(tk.Tk):
         self._set_progress(0, len(urls))
         self._set_busy(True)
         mode = self.format_mode.get()
-        mode_label = (
-            "MP3 (compatible)"
-            if mode == "mp3"
-            else "Opus (tal cual YouTube, máxima fidelidad)"
-        )
         if mode in {"mp3", "opus", "webm"} and not self._ffmpeg:
             messagebox.showwarning(
                 "Falta ffmpeg",
@@ -848,12 +1115,10 @@ class App(tk.Tk):
             )
             self._set_busy(False)
             return
-        self._log(f"Iniciando descarga de {len(urls)} enlace(s)…")
-        self._log(f"Formato: {mode_label}")
-        self._log(f"Paralelo: hasta {PARALLEL_DOWNLOADS} a la vez (worker)")
-        self._log(f"Carpeta: {out_dir}")
-        self._log("Estado: cola durable + worker en segundo plano")
-        self._log("Estructura: Artista / NombreAlbum / canción - artista")
+        self._clear_download_log()
+        self._reset_eta_clock(resume=False)
+        self._set_total_speed([])
+        self._set_eta(finished=0, total=1, live=[], active=False)
 
         self._worker = threading.Thread(
             target=self._enqueue_and_watch,
@@ -876,16 +1141,13 @@ class App(tk.Tk):
             dlstate.create_batch(
                 batch_id, "musica", format_mode, str(out_dir), note="canciones"
             )
-            n = dlstate.enqueue_track_jobs(
+            dlstate.enqueue_track_jobs(
                 batch_id, "musica", urls, str(out_dir), format_mode
             )
-            self._log(f"Encolados: {n} trabajo(s) (batch {batch_id[:8]}…)")
             if not dlstate.ensure_worker_running():
                 self._log("✗ No se pudo iniciar el worker en segundo plano")
                 self.after(0, lambda: self._set_busy(False))
                 return
-            self._log("Worker en segundo plano activo (sobrevive si cierras la ventana)")
-            self._log_offset = len(dlstate.read_worker_log_tail(10_000))
             self.after(0, self._start_status_poll)
         except Exception as exc:  # noqa: BLE001
             self._log(f"✗ Error al encolar: {exc}")
@@ -908,8 +1170,8 @@ class App(tk.Tk):
             return "fail", None
 
         self._log(f"\n[{index}/{total}] {url}")
-        staging = out_dir / ".staging"
-        staging.mkdir(parents=True, exist_ok=True)
+        staging = get_staging_dir(out_dir)
+        scrub_delivery_artifacts(out_dir)
         video_id = extract_youtube_id(url)
 
         try:
