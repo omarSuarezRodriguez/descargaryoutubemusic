@@ -36,6 +36,7 @@ from descargar_musica import (
     find_info_json,
     find_yt_dlp,
     load_info_json_file,
+    normalize_album_folder_name,
     parse_urls,
     promote_staged_to_dest,
     song_artist_basename,
@@ -130,7 +131,7 @@ def strip_artist_from_album(album_name: str, artist: str) -> str:
 
 
 def playlist_album_name(playlist_info: dict, artist: str = "") -> str:
-    """Nombre de álbum/playlist limpio (sin artista duplicado)."""
+    """Nombre de álbum/playlist limpio (sin artista duplicado ni prefijo 'Album -')."""
     album = _as_text(playlist_info.get("album"))
     title = (
         playlist_info.get("title") or playlist_info.get("playlist_title") or ""
@@ -138,7 +139,8 @@ def playlist_album_name(playlist_info: dict, artist: str = "") -> str:
     album_name = album or title or "playlist"
     if not artist:
         artist = playlist_artist_name(playlist_info)
-    return strip_artist_from_album(album_name, artist)
+    album_name = strip_artist_from_album(album_name, artist)
+    return normalize_album_folder_name(album_name)
 
 
 def resolve_playlist_artist(
@@ -439,12 +441,16 @@ def playlist_artist_album(
     if isinstance(track_info, dict):
         track_album = _as_text(track_info.get("album"))
         if track_album:
-            album_name = strip_artist_from_album(track_album, artist)
+            album_name = normalize_album_folder_name(
+                strip_artist_from_album(track_album, artist)
+            )
             if log:
                 log(f"Álbum (pista completa): {album_name}")
 
     artist_clean = clean_filename(artist) if artist else ""
-    album_clean = clean_filename(album_name) if album_name else ""
+    album_clean = (
+        clean_filename(normalize_album_folder_name(album_name)) if album_name else ""
+    )
     if not artist_clean:
         artist_clean = "Artista desconocido"
     if not album_clean:

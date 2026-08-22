@@ -1,4 +1,4 @@
-## v1.10
+## v1.11
 
 - Tras cada descarga nueva: busca letra (LRCLIB) y carátula.
 - Carátula: catálogo iTunes → si no, miniatura de YouTube Music.
@@ -374,5 +374,15 @@ Mejoras para las apps
 
 
 #################################
+## v1.11
 
 
+
+
+
+
+
+Mejoras 
+
+
+#################

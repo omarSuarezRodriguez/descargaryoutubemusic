@@ -78,6 +78,22 @@ def clean_filename(name: str) -> str:
     return name or "audio"
 
 
+# YT Music suele titular playlists de álbum como "Album - NombreReal"
+_ALBUM_TYPE_PREFIX_RE = re.compile(
+    r"^(?:Album|Álbum|EP|Single|Playlist|Compilación|Compilation)\s*[-–—:]\s+",
+    re.IGNORECASE,
+)
+
+
+def normalize_album_folder_name(album: str) -> str:
+    """Quita prefijos tipo 'Album - …' dejando solo el nombre del álbum."""
+    name = (album or "").strip()
+    if not name:
+        return name
+    cleaned = _ALBUM_TYPE_PREFIX_RE.sub("", name, count=1).strip()
+    return cleaned or name
+
+
 def song_artist_basename(info: dict) -> str:
     """Nombre limpio: 'canción - artista'."""
     track = (info.get("track") or "").strip()
@@ -139,7 +155,7 @@ def folder_album_from_info(info: dict) -> str:
     album = info.get("album") or ""
     if isinstance(album, list):
         album = str(album[0]).strip() if album else ""
-    album = str(album).strip()
+    album = normalize_album_folder_name(str(album).strip())
     if not album:
         return "Sin álbum"
     return clean_filename(album) or "Sin álbum"
@@ -151,7 +167,7 @@ def ensure_artist_album_dir(base_dir: Path, artist: str, album: str) -> Path:
     Si existe, reutiliza; si no, crea (parents=True, exist_ok=True).
     """
     artist_dir = clean_filename(artist) or "Artista desconocido"
-    album_dir = clean_filename(album) or "Sin álbum"
+    album_dir = clean_filename(normalize_album_folder_name(album)) or "Sin álbum"
     dest = base_dir / artist_dir / album_dir
     dest.mkdir(parents=True, exist_ok=True)
     return dest
