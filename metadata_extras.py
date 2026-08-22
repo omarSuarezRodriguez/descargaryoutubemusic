@@ -6,6 +6,7 @@ Sin sidecars .jpg/.lrc/.txt.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import urllib.error
 import urllib.parse
@@ -16,7 +17,7 @@ from typing import Callable
 LogFn = Callable[[str], None]
 
 USER_AGENT = (
-    "descargaryoutubemusic/1.04 "
+    "descargaryoutubemusic/1.10 "
     "(local; +https://github.com/omarSuarezRodriguez/descargaryoutubemusic)"
 )
 
@@ -151,11 +152,342 @@ def _lyrics_from_lrclib_item(item: dict) -> str | None:
     return None
 
 
+_LRC_TS = re.compile(
+    r"\[(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?\]"
+)
+
+
+def is_lrc_text(text: str) -> bool:
+    if not text:
+        return False
+    return bool(_LRC_TS.search(text))
+
+
+def lrc_timestamps_seconds(text: str) -> list[float]:
+    out: list[float] = []
+    for m in _LRC_TS.finditer(text or ""):
+        mm = int(m.group(1))
+        ss = int(m.group(2))
+        frac = m.group(3) or "0"
+        # normalizar a fracción 0-1
+        if len(frac) == 1:
+            frac_f = int(frac) / 10.0
+        elif len(frac) == 2:
+            frac_f = int(frac) / 100.0
+        else:
+            frac_f = int(frac[:3]) / 1000.0
+        out.append(mm * 60 + ss + frac_f)
+    return out
+
+
+def lyrics_content_lines(text: str) -> list[str]:
+    """Líneas con contenido (sin timestamps vacíos)."""
+    lines: list[str] = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        # quitar tags LRC para contar texto real
+        plain = _LRC_TS.sub("", line).strip()
+        if plain:
+            lines.append(plain)
+    return lines
+
+
+def score_lyrics_candidate(
+    text: str,
+    *,
+    source: str,
+    duration: float | None = None,
+    synced_preferred: bool = True,
+) -> int:
+    """
+    Puntuación de calidad. Más alto = mejor.
+    Penaliza LRC con duración desalineada o texto demasiado corto.
+    """
+    if not text or not text.strip():
+        return -10_000
+    lines = lyrics_content_lines(text)
+    n_lines = len(lines)
+    n_chars = sum(len(x) for x in lines)
+    synced = is_lrc_text(text)
+    score = 0
+
+    # Completitud básica
+    score += min(n_lines, 120) * 3
+    score += min(n_chars // 20, 80)
+
+    if n_lines < 6:
+        score -= 40
+    if n_chars < 80:
+        score -= 30
+
+    if synced:
+        score += 50 if synced_preferred else 10
+        stamps = lrc_timestamps_seconds(text)
+        if len(stamps) >= 4:
+            span = max(stamps) - min(stamps)
+            score += min(int(span), 400) // 5
+            if duration and duration > 0:
+                # cubrir buena parte de la canción y no pasarse mucho
+                cover = span / duration
+                if 0.55 <= cover <= 1.15:
+                    score += 80
+                elif 0.35 <= cover < 0.55:
+                    score += 20
+                else:
+                    score -= 60
+                # último timestamp cerca del final
+                end_gap = abs(max(stamps) - duration)
+                if end_gap <= 8:
+                    score += 25
+                elif end_gap > 45:
+                    score -= 40
+        else:
+            score -= 30  # LRC pobre
+    else:
+        # plano: útil pero no auto-scroll
+        score += 5
+
+    # Preferencias suaves por fuente
+    src = source.casefold()
+    if "youtube" in src and synced:
+        score += 15
+    if src == "lrclib" and synced:
+        score += 10
+    if src == "lyrics.ovh":
+        score -= 5  # a menudo incompleto
+
+    return score
+
+
+def lyrics_quality_ok(
+    text: str, duration: float | None = None, *, min_lines: int = 8
+) -> bool:
+    if score_lyrics_candidate(text, source="check", duration=duration) < 20:
+        return False
+    n_lines = len(lyrics_content_lines(text))
+    # LRC bien alineado puede tener menos líneas “densas”
+    effective_min = min_lines
+    if is_lrc_text(text):
+        effective_min = min(min_lines, 5)
+    if n_lines < effective_min:
+        if duration and duration < 90:
+            return n_lines >= 4
+        return False
+    if is_lrc_text(text) and duration and duration > 0:
+        stamps = lrc_timestamps_seconds(text)
+        if len(stamps) < 4:
+            return False
+        span = max(stamps) - min(stamps)
+        if span < duration * 0.35:
+            return False
+    return True
+
+
+def _vtt_to_lrc(vtt: str) -> str | None:
+    """Convierte WEBVTT simple a LRC."""
+    import re as _re
+
+    lines_out: list[str] = []
+    # 00:00:01.000 --> 00:00:04.000
+    cue = _re.compile(
+        r"(?:(\d{1,2}):)?(\d{1,2}):(\d{2})\.(\d{3})\s*-->\s*"
+        r"(?:(\d{1,2}):)?(\d{1,2}):(\d{2})\.(\d{3})"
+    )
+    blocks = _re.split(r"\n\s*\n", vtt.replace("\r\n", "\n"))
+    for block in blocks:
+        blines = [ln.strip() for ln in block.split("\n") if ln.strip()]
+        if not blines:
+            continue
+        if blines[0].upper().startswith("WEBVTT"):
+            continue
+        time_line = None
+        text_lines: list[str] = []
+        for ln in blines:
+            if "-->" in ln:
+                time_line = ln
+            elif time_line is not None and not ln.isdigit():
+                # quitar tags tipo <c>
+                cleaned = _re.sub(r"<[^>]+>", "", ln).strip()
+                if cleaned:
+                    text_lines.append(cleaned)
+        if not time_line or not text_lines:
+            continue
+        m = cue.search(time_line)
+        if not m:
+            continue
+        hh = int(m.group(1) or 0)
+        mm = int(m.group(2))
+        ss = int(m.group(3))
+        ms = int(m.group(4))
+        total_mm = hh * 60 + mm
+        cs = ms // 10  # centésimas
+        text = " ".join(text_lines)
+        lines_out.append(f"[{total_mm:02d}:{ss:02d}.{cs:02d}]{text}")
+    if len(lines_out) < 3:
+        return None
+    return "\n".join(lines_out)
+
+
+def _pick_subtitle_track(tracks: object) -> dict | None:
+    if not isinstance(tracks, list):
+        return None
+    # Preferir vtt / srv3 / json3
+    preferred_ext = ("vtt", "srv3", "json3", "ttml", "srv1", "srv2")
+    ranked: list[tuple[int, dict]] = []
+    for t in tracks:
+        if not isinstance(t, dict) or not t.get("url"):
+            continue
+        ext = str(t.get("ext") or "").casefold()
+        try:
+            prio = preferred_ext.index(ext)
+        except ValueError:
+            prio = 50
+        ranked.append((prio, t))
+    if not ranked:
+        return None
+    ranked.sort(key=lambda x: x[0])
+    return ranked[0][1]
+
+
+def extract_youtube_lyrics_from_info(info: dict) -> tuple[str | None, str]:
+    """
+    Intenta letra/subtítulos desde metadatos yt-dlp (subtitles / automatic_captions).
+    Prefer manual > auto; idiomas es/en primero.
+    """
+    if not isinstance(info, dict):
+        return None, "none"
+
+    lang_pref = (
+        "es",
+        "es-419",
+        "es-ES",
+        "en",
+        "en-US",
+        "en-GB",
+    )
+
+    def _from_map(submap: object, label: str) -> tuple[str | None, str]:
+        if not isinstance(submap, dict) or not submap:
+            return None, "none"
+        # ordenar idiomas
+        keys = list(submap.keys())
+        ordered: list[str] = []
+        for pref in lang_pref:
+            for k in keys:
+                if str(k).casefold() == pref.casefold() or str(k).casefold().startswith(
+                    pref.casefold() + "-"
+                ):
+                    if k not in ordered:
+                        ordered.append(k)
+        for k in keys:
+            if k not in ordered:
+                ordered.append(k)
+
+        for lang in ordered:
+            track = _pick_subtitle_track(submap.get(lang))
+            if not track:
+                continue
+            url = str(track.get("url") or "")
+            ext = str(track.get("ext") or "").casefold()
+            if not url:
+                continue
+            try:
+                raw = _http_get(url, timeout=25).decode("utf-8", errors="replace")
+            except Exception:
+                continue
+            text: str | None = None
+            if ext == "vtt" or "WEBVTT" in raw[:80].upper():
+                text = _vtt_to_lrc(raw)
+            elif ext in {"srv3", "json3"}:
+                # a veces JSON de YouTube; intento extracciones simples
+                try:
+                    data = json.loads(raw)
+                    events = data.get("events") if isinstance(data, dict) else None
+                    if isinstance(events, list):
+                        lrc_lines: list[str] = []
+                        for ev in events:
+                            if not isinstance(ev, dict):
+                                continue
+                            t_ms = ev.get("tStartMs")
+                            segs = ev.get("segs")
+                            if t_ms is None or not isinstance(segs, list):
+                                continue
+                            parts = [
+                                str(s.get("utf8") or "")
+                                for s in segs
+                                if isinstance(s, dict)
+                            ]
+                            body = "".join(parts).replace("\n", " ").strip()
+                            if not body or body == "\n":
+                                continue
+                            total_s = int(t_ms) / 1000.0
+                            mm = int(total_s // 60)
+                            ss = int(total_s % 60)
+                            cs = int((total_s - int(total_s)) * 100)
+                            lrc_lines.append(f"[{mm:02d}:{ss:02d}.{cs:02d}]{body}")
+                        if len(lrc_lines) >= 3:
+                            text = "\n".join(lrc_lines)
+                except Exception:
+                    text = None
+            else:
+                # texto plano residual
+                plain = "\n".join(
+                    ln.strip()
+                    for ln in raw.splitlines()
+                    if ln.strip()
+                    and not ln.strip().isdigit()
+                    and "-->" not in ln
+                    and not ln.upper().startswith("WEBVTT")
+                )
+                if len(lyrics_content_lines(plain)) >= 6:
+                    text = plain
+
+            if text and lyrics_quality_ok(text, None, min_lines=4):
+                return text, f"{label}:{lang}"
+        return None, "none"
+
+    text, src = _from_map(info.get("subtitles"), "youtube-sub")
+    if text:
+        return text, src
+    text, src = _from_map(info.get("automatic_captions"), "youtube-auto")
+    if text:
+        return text, src
+    return None, "none"
+
+
 def fetch_lrclib_lyrics(
     artist: str, track: str, album: str = "", duration: float | None = None
 ) -> str | None:
+    """Mejor candidato LRCLIB (no el primero a ciegas)."""
     if not artist or not track:
         return None
+
+    candidates: list[tuple[int, str]] = []
+
+    def _consider(item: dict) -> None:
+        text = _lyrics_from_lrclib_item(item)
+        if not text:
+            return
+        item_dur = item.get("duration")
+        try:
+            item_dur_f = float(item_dur) if item_dur is not None else None
+        except (TypeError, ValueError):
+            item_dur_f = None
+        # bonus si duration del item calza
+        sc = score_lyrics_candidate(
+            text, source="lrclib", duration=duration or item_dur_f
+        )
+        if duration and item_dur_f and duration > 0:
+            gap = abs(item_dur_f - duration)
+            if gap <= 2:
+                sc += 40
+            elif gap <= 5:
+                sc += 15
+            elif gap > 20:
+                sc -= 50
+        candidates.append((sc, text))
 
     params: dict[str, str] = {
         "artist_name": artist,
@@ -170,9 +502,7 @@ def fetch_lrclib_lyrics(
         query = urllib.parse.urlencode(params)
         data = _http_get_json(f"https://lrclib.net/api/get?{query}")
         if isinstance(data, dict):
-            text = _lyrics_from_lrclib_item(data)
-            if text:
-                return text
+            _consider(data)
     except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, json.JSONDecodeError):
         pass
 
@@ -184,12 +514,9 @@ def fetch_lrclib_lyrics(
             query = urllib.parse.urlencode(qparams)
             data = _http_get_json(f"https://lrclib.net/api/search?{query}")
             if isinstance(data, list):
-                for item in data:
-                    if not isinstance(item, dict):
-                        continue
-                    text = _lyrics_from_lrclib_item(item)
-                    if text:
-                        return text
+                for item in data[:12]:
+                    if isinstance(item, dict):
+                        _consider(item)
         except (
             urllib.error.HTTPError,
             urllib.error.URLError,
@@ -198,11 +525,14 @@ def fetch_lrclib_lyrics(
         ):
             continue
 
-    return None
+    if not candidates:
+        return None
+    candidates.sort(key=lambda t: t[0], reverse=True)
+    return candidates[0][1]
 
 
 def fetch_lyrics_ovh(artist: str, track: str) -> str | None:
-    """Fallback simple y público."""
+    """Fallback simple y público (plano)."""
     if not artist or not track:
         return None
     try:
@@ -219,15 +549,70 @@ def fetch_lyrics_ovh(artist: str, track: str) -> str | None:
 
 
 def fetch_lyrics(
-    artist: str, track: str, album: str = "", duration: float | None = None
+    artist: str,
+    track: str,
+    album: str = "",
+    duration: float | None = None,
+    info: dict | None = None,
 ) -> tuple[str | None, str]:
-    """Cascada de letras. Devuelve (texto, fuente)."""
-    text = fetch_lrclib_lyrics(artist, track, album, duration)
-    if text:
-        return text, "lrclib"
-    text = fetch_lyrics_ovh(artist, track)
-    if text:
-        return text, "lyrics.ovh"
+    """
+    Cascada con score:
+    1) YouTube subtitles/auto (si hay en info)
+    2) LRCLIB (mejor match por duración/completitud)
+    3) lyrics.ovh
+    Elige el mejor; si el top no pasa calidad, prueba el siguiente.
+    """
+    ranked: list[tuple[int, str, str]] = []  # score, text, source
+
+    if info:
+        yt_text, yt_src = extract_youtube_lyrics_from_info(info)
+        if yt_text:
+            ranked.append(
+                (
+                    score_lyrics_candidate(
+                        yt_text, source=yt_src, duration=duration
+                    ),
+                    yt_text,
+                    yt_src,
+                )
+            )
+
+    lrclib = fetch_lrclib_lyrics(artist, track, album, duration)
+    if lrclib:
+        ranked.append(
+            (
+                score_lyrics_candidate(
+                    lrclib, source="lrclib", duration=duration
+                ),
+                lrclib,
+                "lrclib",
+            )
+        )
+
+    ovh = fetch_lyrics_ovh(artist, track)
+    if ovh:
+        ranked.append(
+            (
+                score_lyrics_candidate(
+                    ovh, source="lyrics.ovh", duration=duration
+                ),
+                ovh,
+                "lyrics.ovh",
+            )
+        )
+
+    if not ranked:
+        return None, "none"
+
+    ranked.sort(key=lambda t: t[0], reverse=True)
+
+    for sc, text, src in ranked:
+        if lyrics_quality_ok(text, duration):
+            return text, f"{src} (score={sc})"
+    # último recurso: el de mayor score aunque no pase quality_ok estricto
+    best_sc, best_text, best_src = ranked[0]
+    if best_sc >= 10:
+        return best_text, f"{best_src} (score={best_sc}, laxo)"
     return None, "none"
 
 
@@ -429,6 +814,15 @@ def verify_embedded_lyrics(audio_path: Path) -> bool:
     return False
 
 
+def verify_lyrics_text_quality(
+    text: str | None, duration: float | None = None
+) -> bool:
+    """Verificación de contenido (no solo presencia de tag)."""
+    if not text:
+        return False
+    return lyrics_quality_ok(text, duration)
+
+
 def remux_to_opus(audio_path: Path, ffmpeg: Path, log: LogFn) -> Path:
     """Remuxa a .opus sin re-encodear el audio (misma fidelidad)."""
     if audio_path.suffix.lower() == ".opus":
@@ -503,11 +897,14 @@ def attach_lyrics_and_cover(
         if not cover_bytes:
             log("AVISO: no se encontró carátula (ni iTunes ni miniatura YT)")
 
-        lyrics, lyrics_source = fetch_lyrics(artist, track, album, duration_f)
+        lyrics, lyrics_source = fetch_lyrics(
+            artist, track, album, duration_f, info=info
+        )
         if lyrics:
-            log(f"Letra: {lyrics_source}")
+            kind = "LRC (auto-scroll)" if is_lrc_text(lyrics) else "plana (manual)"
+            log(f"Letra: {lyrics_source} [{kind}]")
         else:
-            log("AVISO: no se encontró letra")
+            log("AVISO: no se encontró letra de calidad suficiente")
 
         suffix = audio_path.suffix.lower()
         if suffix == ".mp3":
@@ -533,8 +930,12 @@ def attach_lyrics_and_cover(
             else:
                 log("AVISO: carátula no quedó embebida")
         if lyrics:
-            if verify_embedded_lyrics(audio_path):
+            if verify_embedded_lyrics(audio_path) and verify_lyrics_text_quality(
+                lyrics, duration_f
+            ):
                 log("Letra embebida OK (sin archivo .lrc/.txt)")
+            elif verify_embedded_lyrics(audio_path):
+                log("AVISO: letra embebida pero calidad dudosa (corta o sync floja)")
             else:
                 log("AVISO: letra no quedó embebida")
 

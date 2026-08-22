@@ -1,0 +1,4 @@
+.download_queue/
+__pycache__/
+*.pyc
+.staging/

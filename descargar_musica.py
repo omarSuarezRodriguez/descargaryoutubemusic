@@ -13,10 +13,12 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
+import download_state as dlstate
 from metadata_extras import attach_lyrics_and_cover
 from link_catalog import LinkCatalog, refresh_link_catalog_window, show_link_catalog_window
 
@@ -171,7 +173,7 @@ def find_existing_download(out_dir: Path, basename: str) -> Path | None:
 
 
 def fetch_video_info(base_cmd: list[str], url: str) -> dict:
-    """Obtiene metadatos sin descargar."""
+    """Obtiene metadatos sin descargar (solo usos puntuales, p. ej. enriquecer álbum)."""
     cmd = [
         *base_cmd,
         "--skip-download",
@@ -193,31 +195,52 @@ def fetch_video_info(base_cmd: list[str], url: str) -> dict:
     return json.loads(result.stdout)
 
 
+def extract_youtube_id(url: str) -> str | None:
+    """ID de vídeo desde URL watch/youtu.be/shorts (si se puede)."""
+    m = re.search(
+        r"(?:youtu\.be/|v=|/shorts/|/embed/)([\w-]{6,})",
+        url,
+        re.IGNORECASE,
+    )
+    return m.group(1) if m else None
+
+
 def build_download_cmd(
     base_cmd: list[str],
     url: str,
     out_dir: Path,
     format_mode: str,
     ffmpeg: Path | None,
-    basename: str,
+    basename: str | None = None,
+    *,
+    staging: bool = False,
 ) -> list[str]:
-    """Arma el comando yt-dlp según MP3 (convertir) u Opus/WebM (tal cual)."""
+    """
+    Arma yt-dlp. Si staging=True: salida %(id)s + --write-info-json
+    (metadatos en/tras descarga; sin -J previo).
+    """
+    if staging:
+        out_tmpl = str(out_dir / "%(id)s.%(ext)s")
+    else:
+        if not basename:
+            raise ValueError("basename requerido si staging=False")
+        out_tmpl = str(out_dir / f"{basename}.%(ext)s")
+
     cmd = [
         *base_cmd,
         "-f",
         "bestaudio",
-        # Máximo throughput razonable por archivo (fragments concurrentes)
         "-N",
         "16",
         "-o",
-        str(out_dir / f"{basename}.%(ext)s"),
+        out_tmpl,
         "--no-playlist",
     ]
-    # opus/webm: audio original de YouTube (luego se remuxa a .opus para carátula)
+    if staging:
+        cmd.append("--write-info-json")
     if format_mode in {"opus", "webm"}:
         pass
     else:
-        # MP3 máxima calidad VBR
         cmd.extend(
             [
                 "-x",
@@ -231,6 +254,160 @@ def build_download_cmd(
             cmd.extend(["--ffmpeg-location", str(ffmpeg.parent)])
     cmd.append(url)
     return cmd
+
+
+def load_info_json_file(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8", errors="replace"))
+
+
+def find_info_json(staging_dir: Path, video_id: str | None = None) -> Path | None:
+    if video_id:
+        p = staging_dir / f"{video_id}.info.json"
+        if p.is_file():
+            return p
+    jsons = sorted(
+        staging_dir.glob("*.info.json"),
+        key=lambda x: x.stat().st_mtime,
+        reverse=True,
+    )
+    return jsons[0] if jsons else None
+
+
+def find_staged_audio(staging_dir: Path, video_id: str | None) -> Path | None:
+    if not staging_dir.is_dir():
+        return None
+    if video_id:
+        for path in staging_dir.iterdir():
+            if (
+                path.is_file()
+                and path.stem == video_id
+                and path.suffix.lower() in AUDIO_EXTENSIONS
+            ):
+                return path
+    # Fallback: audio más reciente (sin .info.json)
+    audios = [
+        p
+        for p in staging_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in AUDIO_EXTENSIONS
+    ]
+    if not audios:
+        return None
+    audios.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+    return audios[0]
+
+
+def cleanup_staging_id(staging_dir: Path, video_id: str | None) -> None:
+    if not video_id or not staging_dir.is_dir():
+        return
+    for path in list(staging_dir.iterdir()):
+        if path.is_file() and (
+            path.stem == video_id or path.name.startswith(f"{video_id}.")
+        ):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
+def promote_staged_to_dest(
+    staging_dir: Path,
+    dest_dir: Path,
+    info: dict,
+) -> tuple[str, Path | None, str]:
+    """
+    Mueve audio de staging a dest_dir como 'canción - artista.ext'.
+    Devuelve (ok|skipped|fail, path_final|None, basename).
+    """
+    basename = song_artist_basename(info)
+    video_id = str(info.get("id") or "") or None
+    try:
+        if find_existing_download(dest_dir, basename):
+            return "skipped", None, basename
+        audio = find_staged_audio(staging_dir, video_id)
+        if audio is None:
+            return "fail", None, basename
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        final_path = dest_dir / f"{basename}{audio.suffix.lower()}"
+        if final_path.exists():
+            return "skipped", None, basename
+        audio.replace(final_path)
+        return "ok", final_path, basename
+    finally:
+        cleanup_staging_id(staging_dir, video_id)
+
+
+ID_NAME_CACHE = ".yt_id_names.json"
+
+
+def _cache_path(base_dir: Path) -> Path:
+    return base_dir / ID_NAME_CACHE
+
+
+def load_id_name_cache(base_dir: Path) -> dict[str, dict[str, str]]:
+    path = _cache_path(base_dir)
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_id_name_cache(base_dir: Path, cache: dict[str, dict[str, str]]) -> None:
+    try:
+        _cache_path(base_dir).write_text(
+            json.dumps(cache, ensure_ascii=False, indent=0),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def cache_lookup_existing(
+    base_dir: Path,
+    video_id: str | None,
+    *,
+    fixed_dest: Path | None = None,
+) -> tuple[str, Path] | None:
+    """Si hay caché del id y el archivo ya existe → (basename, path)."""
+    if not video_id:
+        return None
+    cache = load_id_name_cache(base_dir)
+    entry = cache.get(video_id)
+    if not isinstance(entry, dict):
+        return None
+    basename = (entry.get("basename") or "").strip()
+    if not basename:
+        return None
+    if fixed_dest is not None:
+        dest = fixed_dest
+    else:
+        artist = entry.get("artist") or "Artista desconocido"
+        album = entry.get("album") or "Sin álbum"
+        dest = base_dir / clean_filename(artist) / clean_filename(album)
+    existing = find_existing_download(dest, basename)
+    if existing:
+        return basename, existing
+    return None
+
+
+def cache_remember(
+    base_dir: Path,
+    video_id: str | None,
+    basename: str,
+    artist: str,
+    album: str,
+) -> None:
+    if not video_id or not basename:
+        return
+    cache = load_id_name_cache(base_dir)
+    cache[video_id] = {
+        "basename": basename,
+        "artist": artist,
+        "album": album,
+    }
+    save_id_name_cache(base_dir, cache)
 
 
 def parse_urls(text: str) -> list[str]:
@@ -253,6 +430,21 @@ def parse_urls(text: str) -> list[str]:
     return urls
 
 
+def ask_cancel_download(parent: tk.Misc, detail: str | None = None) -> bool:
+    """Diálogo: ¿cancelar la descarga en curso? True = sí cancelar."""
+    msg = detail or (
+        "Hay una descarga en curso.\n\n¿Desea cancelar la descarga?"
+    )
+    return bool(
+        messagebox.askyesno(
+            "Cancelar descarga",
+            msg,
+            parent=parent,
+            icon="warning",
+        )
+    )
+
+
 class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -272,11 +464,16 @@ class App(tk.Tk):
         self.clipboard_watch = tk.BooleanVar(value=True)
         self.format_mode = tk.StringVar(value="mp3")
         self._link_catalog = LinkCatalog()
+        self._active_batch_id: str | None = None
+        self._poll_after_id: str | None = None
+        self._log_offset = 0
 
         self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(100, self._drain_log_queue)
         self.after(200, self._check_deps)
         self.after(400, self._poll_clipboard)
+        self.after(600, self._resume_background_if_needed)
 
     def _build_ui(self) -> None:
         pad = {"padx": 12, "pady": 6}
@@ -339,7 +536,9 @@ class App(tk.Tk):
             btn_row, text="Listado…", command=self._open_link_list
         ).pack(side=tk.LEFT, padx=(8, 0))
         self.progress = ttk.Progressbar(btn_row, mode="determinate")
-        self.progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(12, 0))
+        self.progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(12, 8))
+        self.progress_pct = ttk.Label(btn_row, text="0%", width=5, anchor=tk.E)
+        self.progress_pct.pack(side=tk.LEFT)
 
         ttk.Label(root, text="Registro:").pack(anchor=tk.W, padx=12, pady=(8, 0))
         self.txt_log = scrolledtext.ScrolledText(
@@ -429,14 +628,175 @@ class App(tk.Tk):
             self.txt_log.configure(state=tk.DISABLED)
         self.after(100, self._drain_log_queue)
 
+    def _set_progress(self, value: int | float, maximum: int | float = 1) -> None:
+        """Actualiza barra + porcentaje (elegante, ancho fijo)."""
+        try:
+            maximum = float(maximum)
+            value = float(value)
+        except (TypeError, ValueError):
+            maximum, value = 1.0, 0.0
+        if maximum <= 0:
+            maximum = 1.0
+        value = max(0.0, min(value, maximum))
+        self.progress.configure(maximum=maximum, value=value)
+        pct = int(round(100.0 * value / maximum))
+        pct = max(0, min(pct, 100))
+        self.progress_pct.configure(text=f"{pct}%")
+
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
-        self.btn_download.configure(state=tk.DISABLED if busy else tk.NORMAL)
+        # Descargar sigue activo para poder pedir cancelación por error
+        self.btn_download.configure(state=tk.NORMAL)
         self.btn_stop.configure(state=tk.NORMAL if busy else tk.DISABLED)
         self.txt_urls.configure(state=tk.DISABLED if busy else tk.NORMAL)
 
+    def _is_downloading(self) -> bool:
+        if self._busy or (self._worker is not None and self._worker.is_alive()):
+            return True
+        try:
+            return dlstate.active_job_count() > 0
+        except Exception:
+            return False
+
+    def _request_cancel_download(self) -> bool:
+        """Pregunta siempre si hay descarga; si confirma, cancela cola + worker."""
+        if not self._is_downloading():
+            return False
+        if not ask_cancel_download(self):
+            return False
+        self._stop_flag.set()
+        try:
+            n = dlstate.cancel_active_jobs()
+            dlstate.request_worker_stop()
+            self._log(
+                f"Cancelación confirmada… ({n} trabajo(s) marcados; "
+                "el worker se detendrá)"
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"AVISO al cancelar cola: {exc}")
+        return True
+
+    def _on_close(self) -> None:
+        active = False
+        try:
+            active = self._is_downloading() or dlstate.active_job_count() > 0
+        except Exception:
+            active = self._is_downloading()
+        if active:
+            answer = messagebox.askyesnocancel(
+                "Cerrar",
+                "Hay descargas en curso o en cola.\n\n"
+                "Sí = cerrar y dejar en SEGUNDO PLANO (sigue descargando)\n"
+                "No = CANCELAR descargas y cerrar\n"
+                "Cancelar = no cerrar la ventana",
+                parent=self,
+            )
+            if answer is None:
+                return
+            if answer is False:
+                try:
+                    dlstate.cancel_active_jobs()
+                    dlstate.request_worker_stop()
+                except Exception:
+                    pass
+                self._stop_flag.set()
+                self._log("Cierre: descargas canceladas.")
+            else:
+                self._log("Cierre: descargas siguen en segundo plano.")
+        self.destroy()
+
+    def _resume_background_if_needed(self) -> None:
+        """Si hay cola/worker activo al abrir, reconecta la UI al estado."""
+        try:
+            dlstate.init_db()
+            active = dlstate.active_job_count()
+            running = dlstate.worker_is_running()
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"AVISO estado cola: {exc}")
+            return
+        if active <= 0 and not running:
+            return
+        if active > 0 and not running:
+            dlstate.ensure_worker_running()
+        self._set_busy(True)
+        self._log(
+            f"Estado recuperado: {active} en cola/ejecución. "
+            "Las descargas continúan en segundo plano."
+        )
+        self._start_status_poll()
+
+    def _start_status_poll(self) -> None:
+        if self._poll_after_id is not None:
+            try:
+                self.after_cancel(self._poll_after_id)
+            except Exception:
+                pass
+        self._poll_status_tick()
+
+    def _poll_status_tick(self) -> None:
+        try:
+            snap = dlstate.snapshot_status()
+            batch_id = self._active_batch_id
+            if batch_id:
+                prog = dlstate.batch_progress(batch_id)
+                total = max(int(prog.get("total", 0)), 1)
+                finished = int(prog.get("finished", 0))
+                self._set_progress(finished, total)
+                counts = prog
+                active = (
+                    int(prog.get(dlstate.STATUS_PENDING, 0))
+                    + int(prog.get(dlstate.STATUS_RUNNING, 0))
+                )
+            else:
+                counts = snap["counts"]
+                finished = (
+                    counts.get(dlstate.STATUS_DONE, 0)
+                    + counts.get(dlstate.STATUS_SKIPPED, 0)
+                    + counts.get(dlstate.STATUS_FAILED, 0)
+                    + counts.get(dlstate.STATUS_CANCELLED, 0)
+                )
+                total = max(sum(counts.values()), 1)
+                self._set_progress(finished, total)
+                active = int(snap.get("active", 0))
+
+            tail = snap.get("log_tail") or []
+            if len(tail) > self._log_offset:
+                for line in tail[self._log_offset :]:
+                    self._log(line)
+                self._log_offset = len(tail)
+
+            if active <= 0 and not (
+                self._worker and self._worker.is_alive()
+            ):
+                ok = int(counts.get(dlstate.STATUS_DONE, 0))
+                skipped = int(counts.get(dlstate.STATUS_SKIPPED, 0))
+                fail = int(counts.get(dlstate.STATUS_FAILED, 0))
+                self._log(
+                    f"\nListo. Descargadas: {ok} | Ya estaban: {skipped} | Fallidos: {fail}"
+                )
+                self._set_busy(False)
+                self._poll_after_id = None
+                self._active_batch_id = None
+                if ok or skipped:
+                    out = self.download_dir.get()
+                    self.after(
+                        0,
+                        lambda: messagebox.showinfo(
+                            "Descarga terminada",
+                            f"Descargadas: {ok}\n"
+                            f"Ya estaban descargadas: {skipped}\n"
+                            f"Fallidos: {fail}\n\n"
+                            f"Carpeta:\n{out}",
+                        ),
+                    )
+                return
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"AVISO poll: {exc}")
+        self._poll_after_id = self.after(800, self._poll_status_tick)
+
     def _start_download(self) -> None:
-        if self._worker and self._worker.is_alive():
+        if self._is_downloading():
+            self._request_cancel_download()
             return
 
         urls = parse_urls(self.txt_urls.get("1.0", tk.END))
@@ -455,7 +815,7 @@ class App(tk.Tk):
             return
 
         self._stop_flag.clear()
-        self.progress.configure(maximum=len(urls), value=0)
+        self._set_progress(0, len(urls))
         self._set_busy(True)
         mode = self.format_mode.get()
         mode_label = (
@@ -474,22 +834,46 @@ class App(tk.Tk):
             return
         self._log(f"Iniciando descarga de {len(urls)} enlace(s)…")
         self._log(f"Formato: {mode_label}")
-        self._log(f"Paralelo: hasta {PARALLEL_DOWNLOADS} a la vez")
+        self._log(f"Paralelo: hasta {PARALLEL_DOWNLOADS} a la vez (worker)")
         self._log(f"Carpeta: {out_dir}")
+        self._log("Estado: cola durable + worker en segundo plano")
         self._log("Estructura: Artista / NombreAlbum / canción - artista")
-        self._log("Nombre: canción - artista")
-        self._log("Extras: carátula + letra embebidas (1 solo archivo)")
 
         self._worker = threading.Thread(
-            target=self._download_all,
+            target=self._enqueue_and_watch,
             args=(urls, out_dir, mode),
             daemon=True,
         )
         self._worker.start()
 
     def _stop_download(self) -> None:
-        self._stop_flag.set()
-        self._log("Detención solicitada… (terminarán las descargas en curso)")
+        self._request_cancel_download()
+
+    def _enqueue_and_watch(
+        self, urls: list[str], out_dir: Path, format_mode: str
+    ) -> None:
+        """Encola en SQLite y asegura worker; la UI hace poll del estado."""
+        try:
+            batch_id = str(uuid.uuid4())
+            self._active_batch_id = batch_id
+            dlstate.init_db()
+            dlstate.create_batch(
+                batch_id, "musica", format_mode, str(out_dir), note="canciones"
+            )
+            n = dlstate.enqueue_track_jobs(
+                batch_id, "musica", urls, str(out_dir), format_mode
+            )
+            self._log(f"Encolados: {n} trabajo(s) (batch {batch_id[:8]}…)")
+            if not dlstate.ensure_worker_running():
+                self._log("✗ No se pudo iniciar el worker en segundo plano")
+                self.after(0, lambda: self._set_busy(False))
+                return
+            self._log("Worker en segundo plano activo (sobrevive si cierras la ventana)")
+            self._log_offset = len(dlstate.read_worker_log_tail(10_000))
+            self.after(0, self._start_status_poll)
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"✗ Error al encolar: {exc}")
+            self.after(0, lambda: self._set_busy(False))
 
     def _download_one_url(
         self,
@@ -499,30 +883,37 @@ class App(tk.Tk):
         format_mode: str,
         index: int,
         total: int,
-    ) -> str:
-        """Descarga una URL. Devuelve: ok | skipped | fail."""
+    ) -> tuple[str, tuple[Path, str, dict] | None]:
+        """
+        Fase 1: descarga audio sin -J previo.
+        Metadatos desde --write-info-json; luego mueve a Artista/Álbum/.
+        """
         if self._stop_flag.is_set():
-            return "fail"
+            return "fail", None
 
         self._log(f"\n[{index}/{total}] {url}")
-        try:
-            info = fetch_video_info(base_cmd, url)
-            basename = song_artist_basename(info)
-            artist_folder = folder_artist_from_info(info)
-            album_folder = folder_album_from_info(info)
-            track_dir = ensure_artist_album_dir(out_dir, artist_folder, album_folder)
-            self._link_catalog.add(basename, url)
-            self.after(0, lambda: refresh_link_catalog_window(self))
-            self._log(f"[{index}] Nombre: {basename}")
-            self._log(f"[{index}] Carpeta: {artist_folder} / {album_folder}")
+        staging = out_dir / ".staging"
+        staging.mkdir(parents=True, exist_ok=True)
+        video_id = extract_youtube_id(url)
 
-            existing = find_existing_download(track_dir, basename)
-            if existing:
+        try:
+            # Skip rápido sin -J si ya conocemos id→nombre de una descarga previa
+            hit = cache_lookup_existing(out_dir, video_id)
+            if hit:
+                basename, existing = hit
+                self._link_catalog.add(basename, url)
+                self.after(0, lambda: refresh_link_catalog_window(self))
+                self._log(f"[{index}] Nombre: {basename}")
                 self._log(f"[{index}] ⊘ Ya estaba descargada: {existing.name}")
-                return "skipped"
+                return "skipped", None
 
             cmd = build_download_cmd(
-                base_cmd, url, track_dir, format_mode, self._ffmpeg, basename
+                base_cmd,
+                url,
+                staging,
+                format_mode,
+                self._ffmpeg,
+                staging=True,
             )
             process = subprocess.Popen(
                 cmd,
@@ -548,35 +939,94 @@ class App(tk.Tk):
                     self._log(f"[{index}] {line}")
             code = process.wait()
             if self._stop_flag.is_set():
-                return "fail"
-            if code == 0:
-                self._log(f"[{index}] ✓ Completado ({index}/{total})")
-                audio_path = find_existing_download(track_dir, basename)
-                if audio_path:
-                    attach_lyrics_and_cover(
-                        audio_path,
-                        basename,
-                        info,
-                        self._ffmpeg,
-                        self._log,
-                    )
-                else:
-                    self._log(
-                        f"[{index}] AVISO: audio OK pero no se encontró el archivo para extras"
-                    )
-                return "ok"
-            self._log(f"[{index}] ✗ Error (código {code}) en {url}")
-            return "fail"
+                cleanup_staging_id(staging, video_id)
+                return "fail", None
+            if code != 0:
+                cleanup_staging_id(staging, video_id)
+                self._log(f"[{index}] ✗ Error (código {code}) en {url}")
+                return "fail", None
+
+            info_path = find_info_json(staging, video_id)
+            if info_path is None:
+                cleanup_staging_id(staging, video_id)
+                self._log(f"[{index}] ✗ Sin metadatos (.info.json) tras la descarga")
+                return "fail", None
+
+            info = load_info_json_file(info_path)
+            if not video_id:
+                video_id = str(info.get("id") or "") or None
+
+            basename = song_artist_basename(info)
+            artist_folder = folder_artist_from_info(info)
+            album_folder = folder_album_from_info(info)
+            track_dir = ensure_artist_album_dir(out_dir, artist_folder, album_folder)
+            self._link_catalog.add(basename, url)
+            self.after(0, lambda: refresh_link_catalog_window(self))
+            self._log(f"[{index}] Nombre: {basename}")
+            self._log(f"[{index}] Carpeta: {artist_folder} / {album_folder}")
+
+            status, final_path, basename = promote_staged_to_dest(
+                staging, track_dir, info
+            )
+            cache_remember(
+                out_dir,
+                video_id or str(info.get("id") or "") or None,
+                basename,
+                artist_folder,
+                album_folder,
+            )
+            if status == "skipped":
+                self._log(f"[{index}] ⊘ Ya estaba descargada: {basename}")
+                return "skipped", None
+            if status == "ok" and final_path is not None:
+                self._log(f"[{index}] ✓ Audio listo ({index}/{total})")
+                return "ok", (final_path, basename, info)
+            self._log(f"[{index}] ✗ No se pudo colocar el archivo final")
+            return "fail", None
         except FileNotFoundError:
             self._log(
                 "✗ No se encontró yt-dlp. Instálalo con:\n"
                 "  python -m pip install yt-dlp"
             )
             self._stop_flag.set()
-            return "fail"
+            return "fail", None
         except Exception as exc:  # noqa: BLE001
+            cleanup_staging_id(staging, video_id)
             self._log(f"[{index}] ✗ Excepción: {exc}")
-            return "fail"
+            return "fail", None
+
+    def _apply_extras_batch(
+        self, pending: list[tuple[Path, str, dict]], title: str = "Fase 2"
+    ) -> None:
+        """Fase 2: carátula + letra sobre audios ya descargados."""
+        if not pending or self._stop_flag.is_set():
+            return
+        self._log(f"\n{title}: carátula + letra ({len(pending)} archivo(s))…")
+
+        def _one(item: tuple[Path, str, dict]) -> None:
+            if self._stop_flag.is_set():
+                return
+            audio_path, basename, info = item
+            # Re-localizar por si el remux previo de otro hilo no aplica; path es el de fase 1
+            self._log(f"  Extras: {basename}")
+            try:
+                attach_lyrics_and_cover(
+                    audio_path,
+                    basename,
+                    info,
+                    self._ffmpeg,
+                    self._log,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._log(f"  AVISO: extras fallaron en {basename} ({exc})")
+
+        with ThreadPoolExecutor(max_workers=PARALLEL_DOWNLOADS) as pool:
+            futs = [pool.submit(_one, item) for item in pending]
+            for fut in as_completed(futs):
+                try:
+                    fut.result()
+                except Exception as exc:  # noqa: BLE001
+                    self._log(f"  AVISO: extras worker ({exc})")
 
     def _download_all(self, urls: list[str], out_dir: Path, format_mode: str) -> None:
         base_cmd = find_yt_dlp()
@@ -584,8 +1034,10 @@ class App(tk.Tk):
         lock = threading.Lock()
         done = 0
         total = len(urls)
+        pending_extras: list[tuple[Path, str, dict]] = []
 
         self._log(f"Paralelo: hasta {PARALLEL_DOWNLOADS} descargas a la vez")
+        self._log("Fase 1: descarga de audio…")
 
         with ThreadPoolExecutor(max_workers=PARALLEL_DOWNLOADS) as pool:
             futures = [
@@ -601,17 +1053,22 @@ class App(tk.Tk):
                 for index, url in enumerate(urls, start=1)
             ]
             for fut in as_completed(futures):
-                result = fut.result()
+                result, extras = fut.result()
                 with lock:
                     if result in counters:
                         counters[result] += 1
+                    if extras is not None:
+                        pending_extras.append(extras)
                     done += 1
                     current = done
-                self.after(0, lambda v=current: self.progress.configure(value=v))
+                self.after(0, lambda v=current: self._set_progress(v, total))
+
+        if not self._stop_flag.is_set():
+            self._apply_extras_batch(pending_extras, title="Fase 2")
+        else:
+            self._log("Descargas detenidas por el usuario.")
 
         ok, skipped, fail = counters["ok"], counters["skipped"], counters["fail"]
-        if self._stop_flag.is_set():
-            self._log("Descargas detenidas por el usuario.")
         self._log(
             f"\nListo. Descargadas: {ok} | Ya estaban: {skipped} | Fallidos: {fail}"
         )
