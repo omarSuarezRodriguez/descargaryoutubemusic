@@ -1,6 +1,7 @@
 """
 Descargador de audio desde YouTube Music / YouTube.
-Pega varios enlaces (uno por línea) y descarga MP3 o WebM en orden.
+Pega varios enlaces (uno por línea) y descarga MP3 u Opus.
+Hasta 2 descargas en paralelo (misma calidad; solo velocidad).
 """
 
 from __future__ import annotations
@@ -12,12 +13,16 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 from metadata_extras import attach_lyrics_and_cover
+from link_catalog import LinkCatalog, refresh_link_catalog_window, show_link_catalog_window
 
 AUDIO_EXTENSIONS = {".mp3", ".webm", ".m4a", ".opus", ".ogg", ".flac", ".wav", ".aac"}
+# Solo velocidad: 2 pistas a la vez (no afecta calidad/formato)
+PARALLEL_DOWNLOADS = 2
 
 
 def find_yt_dlp() -> list[str]:
@@ -103,6 +108,53 @@ def song_artist_basename(info: dict) -> str:
     return clean_filename(title or track or "audio")
 
 
+def folder_artist_from_info(info: dict) -> str:
+    """Artista para carpeta (sin caracteres inválidos)."""
+    artist = (
+        info.get("artist")
+        or info.get("album_artist")
+        or info.get("creator")
+        or ""
+    )
+    if isinstance(artist, list):
+        artist = ", ".join(str(a) for a in artist if a)
+    artist = str(artist).strip()
+    if artist.casefold().endswith(" - topic"):
+        artist = artist[: -len(" - Topic")].strip()
+    if not artist:
+        title = (info.get("title") or "").strip()
+        if " - " in title:
+            artist = title.split(" - ", 1)[0].strip()
+        else:
+            artist = (info.get("uploader") or info.get("channel") or "").strip()
+            if artist.casefold().endswith(" - topic"):
+                artist = artist[: -len(" - Topic")].strip()
+    return clean_filename(artist) or "Artista desconocido"
+
+
+def folder_album_from_info(info: dict) -> str:
+    """Álbum para carpeta; si falta → 'Sin álbum'."""
+    album = info.get("album") or ""
+    if isinstance(album, list):
+        album = str(album[0]).strip() if album else ""
+    album = str(album).strip()
+    if not album:
+        return "Sin álbum"
+    return clean_filename(album) or "Sin álbum"
+
+
+def ensure_artist_album_dir(base_dir: Path, artist: str, album: str) -> Path:
+    """
+    Destino: base / Artista / NombreAlbum /
+    Si existe, reutiliza; si no, crea (parents=True, exist_ok=True).
+    """
+    artist_dir = clean_filename(artist) or "Artista desconocido"
+    album_dir = clean_filename(album) or "Sin álbum"
+    dest = base_dir / artist_dir / album_dir
+    dest.mkdir(parents=True, exist_ok=True)
+    return dest
+
+
 def find_existing_download(out_dir: Path, basename: str) -> Path | None:
     """Busca si ya hay un archivo con ese nombre (cualquier extensión de audio)."""
     if not out_dir.is_dir():
@@ -154,6 +206,9 @@ def build_download_cmd(
         *base_cmd,
         "-f",
         "bestaudio",
+        # Máximo throughput razonable por archivo (fragments concurrentes)
+        "-N",
+        "16",
         "-o",
         str(out_dir / f"{basename}.%(ext)s"),
         "--no-playlist",
@@ -216,6 +271,7 @@ class App(tk.Tk):
         self._last_clip: str | None = None
         self.clipboard_watch = tk.BooleanVar(value=True)
         self.format_mode = tk.StringVar(value="mp3")
+        self._link_catalog = LinkCatalog()
 
         self._build_ui()
         self.after(100, self._drain_log_queue)
@@ -279,6 +335,9 @@ class App(tk.Tk):
             btn_row, text="Detener", command=self._stop_download, state=tk.DISABLED
         )
         self.btn_stop.pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(
+            btn_row, text="Listado…", command=self._open_link_list
+        ).pack(side=tk.LEFT, padx=(8, 0))
         self.progress = ttk.Progressbar(btn_row, mode="determinate")
         self.progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(12, 0))
 
@@ -287,6 +346,9 @@ class App(tk.Tk):
             root, height=10, wrap=tk.WORD, state=tk.DISABLED
         )
         self.txt_log.pack(fill=tk.BOTH, expand=True, **pad)
+
+    def _open_link_list(self) -> None:
+        show_link_catalog_window(self, self._link_catalog)
 
     def _choose_folder(self) -> None:
         path = filedialog.askdirectory(initialdir=self.download_dir.get())
@@ -412,7 +474,9 @@ class App(tk.Tk):
             return
         self._log(f"Iniciando descarga de {len(urls)} enlace(s)…")
         self._log(f"Formato: {mode_label}")
+        self._log(f"Paralelo: hasta {PARALLEL_DOWNLOADS} a la vez")
         self._log(f"Carpeta: {out_dir}")
+        self._log("Estructura: Artista / NombreAlbum / canción - artista")
         self._log("Nombre: canción - artista")
         self._log("Extras: carátula + letra embebidas (1 solo archivo)")
 
@@ -425,93 +489,129 @@ class App(tk.Tk):
 
     def _stop_download(self) -> None:
         self._stop_flag.set()
-        self._log("Detención solicitada… (terminará el archivo actual)")
+        self._log("Detención solicitada… (terminarán las descargas en curso)")
+
+    def _download_one_url(
+        self,
+        base_cmd: list[str],
+        url: str,
+        out_dir: Path,
+        format_mode: str,
+        index: int,
+        total: int,
+    ) -> str:
+        """Descarga una URL. Devuelve: ok | skipped | fail."""
+        if self._stop_flag.is_set():
+            return "fail"
+
+        self._log(f"\n[{index}/{total}] {url}")
+        try:
+            info = fetch_video_info(base_cmd, url)
+            basename = song_artist_basename(info)
+            artist_folder = folder_artist_from_info(info)
+            album_folder = folder_album_from_info(info)
+            track_dir = ensure_artist_album_dir(out_dir, artist_folder, album_folder)
+            self._link_catalog.add(basename, url)
+            self.after(0, lambda: refresh_link_catalog_window(self))
+            self._log(f"[{index}] Nombre: {basename}")
+            self._log(f"[{index}] Carpeta: {artist_folder} / {album_folder}")
+
+            existing = find_existing_download(track_dir, basename)
+            if existing:
+                self._log(f"[{index}] ⊘ Ya estaba descargada: {existing.name}")
+                return "skipped"
+
+            cmd = build_download_cmd(
+                base_cmd, url, track_dir, format_mode, self._ffmpeg, basename
+            )
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            assert process.stdout is not None
+            for line in process.stdout:
+                if self._stop_flag.is_set():
+                    process.terminate()
+                    try:
+                        process.wait(timeout=8)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                    self._log(f"[{index}] Proceso detenido.")
+                    break
+                line = line.rstrip()
+                if line:
+                    self._log(f"[{index}] {line}")
+            code = process.wait()
+            if self._stop_flag.is_set():
+                return "fail"
+            if code == 0:
+                self._log(f"[{index}] ✓ Completado ({index}/{total})")
+                audio_path = find_existing_download(track_dir, basename)
+                if audio_path:
+                    attach_lyrics_and_cover(
+                        audio_path,
+                        basename,
+                        info,
+                        self._ffmpeg,
+                        self._log,
+                    )
+                else:
+                    self._log(
+                        f"[{index}] AVISO: audio OK pero no se encontró el archivo para extras"
+                    )
+                return "ok"
+            self._log(f"[{index}] ✗ Error (código {code}) en {url}")
+            return "fail"
+        except FileNotFoundError:
+            self._log(
+                "✗ No se encontró yt-dlp. Instálalo con:\n"
+                "  python -m pip install yt-dlp"
+            )
+            self._stop_flag.set()
+            return "fail"
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"[{index}] ✗ Excepción: {exc}")
+            return "fail"
 
     def _download_all(self, urls: list[str], out_dir: Path, format_mode: str) -> None:
         base_cmd = find_yt_dlp()
-        ok = 0
-        skipped = 0
-        fail = 0
+        counters = {"ok": 0, "skipped": 0, "fail": 0}
+        lock = threading.Lock()
+        done = 0
+        total = len(urls)
 
-        for index, url in enumerate(urls, start=1):
-            if self._stop_flag.is_set():
-                self._log("Descargas detenidas por el usuario.")
-                break
+        self._log(f"Paralelo: hasta {PARALLEL_DOWNLOADS} descargas a la vez")
 
-            self._log(f"\n[{index}/{len(urls)}] {url}")
-            try:
-                info = fetch_video_info(base_cmd, url)
-                basename = song_artist_basename(info)
-                self._log(f"Nombre: {basename}")
-
-                existing = find_existing_download(out_dir, basename)
-                if existing:
-                    skipped += 1
-                    self._log(f"⊘ Ya estaba descargada: {existing.name}")
-                    self.after(0, lambda v=index: self.progress.configure(value=v))
-                    continue
-
-                cmd = build_download_cmd(
-                    base_cmd, url, out_dir, format_mode, self._ffmpeg, basename
+        with ThreadPoolExecutor(max_workers=PARALLEL_DOWNLOADS) as pool:
+            futures = [
+                pool.submit(
+                    self._download_one_url,
+                    base_cmd,
+                    url,
+                    out_dir,
+                    format_mode,
+                    index,
+                    total,
                 )
-                process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                )
-                assert process.stdout is not None
-                for line in process.stdout:
-                    if self._stop_flag.is_set():
-                        process.terminate()
-                        try:
-                            process.wait(timeout=8)
-                        except subprocess.TimeoutExpired:
-                            process.kill()
-                        self._log("Proceso actual detenido.")
-                        break
-                    line = line.rstrip()
-                    if line:
-                        self._log(line)
-                code = process.wait()
-                if self._stop_flag.is_set():
-                    fail += 1
-                    break
-                if code == 0:
-                    ok += 1
-                    self._log(f"✓ Completado ({index}/{len(urls)})")
-                    audio_path = find_existing_download(out_dir, basename)
-                    if audio_path:
-                        attach_lyrics_and_cover(
-                            audio_path,
-                            basename,
-                            info,
-                            self._ffmpeg,
-                            self._log,
-                        )
-                    else:
-                        self._log(
-                            "AVISO: audio OK pero no se encontró el archivo para extras"
-                        )
-                else:
-                    fail += 1
-                    self._log(f"✗ Error (código {code}) en {url}")
-            except FileNotFoundError:
-                fail += 1
-                self._log(
-                    "✗ No se encontró yt-dlp. Instálalo con:\n"
-                    "  python -m pip install yt-dlp"
-                )
-                break
-            except Exception as exc:  # noqa: BLE001
-                fail += 1
-                self._log(f"✗ Excepción: {exc}")
+                for index, url in enumerate(urls, start=1)
+            ]
+            for fut in as_completed(futures):
+                result = fut.result()
+                with lock:
+                    if result in counters:
+                        counters[result] += 1
+                    done += 1
+                    current = done
+                self.after(0, lambda v=current: self.progress.configure(value=v))
 
-            self.after(0, lambda v=index: self.progress.configure(value=v))
-
+        ok, skipped, fail = counters["ok"], counters["skipped"], counters["fail"]
+        if self._stop_flag.is_set():
+            self._log("Descargas detenidas por el usuario.")
         self._log(
             f"\nListo. Descargadas: {ok} | Ya estaban: {skipped} | Fallidos: {fail}"
         )

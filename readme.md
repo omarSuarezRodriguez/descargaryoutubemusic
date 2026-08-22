@@ -1,4 +1,4 @@
-## v1.08
+## v1.09
 
 - Tras cada descarga nueva: busca letra (LRCLIB) y carátula.
 - Carátula: catálogo iTunes → si no, miniatura de YouTube Music.
@@ -324,8 +324,45 @@ Mejoras implementadas
 
 
 ########################
+## v1.09
+
+
+## prompt ##
+
+También quiero que audites, analices, mires la mejor opción añadas esta funcionalidad como mejora incremental, no quiero que toques nada relacionado a la calidad del audio ni formato ni nada ,los cambios serán exclusivamente relacionados a la velocidad de descarga de ambas app
+
+4. Que al descargar, el orden quede así: / Artista / NombreAlbum / Canción - Artista
+que revise cuando vaya a crear todo si existe y guardar dentro, y si no crear uno nuevo
+
+conserva todo muy bien, que funcione super bien, mejora mínima incremental, solamente implementando lo que se te pide, al final revisa que todo quedó bien implementado y funciona como se espera, has comprobaciones y validaciones de que todo funciona correctamente
 
 
 
+## resp cursor ##
+
+
+Hecho
+Estructura en ambas apps:
+
+CarpetaBase / Artista / NombreAlbum / Canción - Artista.ext
+Si Artista o NombreAlbum ya existen → guarda dentro (exist_ok=True)
+Si no → los crea
+Sin álbum en metadatos → carpeta Sin álbum
+Skip de duplicados mira esa carpeta del álbum
+Extra (velocidad playlists)
+Ya no consulta año (iTunes/MusicBrainz) para nombrar carpetas; la ruta es solo Artista / NombreAlbum.
+
+Sin tocar
+Calidad, bestaudio, -N, paralelo ×2, formatos.
+
+Validado
+Crear/reutilizar carpetas, naming, sin año en ruta, calidad intacta, UI OK.
+
+
+
+
+
+
+####################
 
 

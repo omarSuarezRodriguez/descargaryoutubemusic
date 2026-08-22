@@ -1,9 +1,9 @@
 """
 Descargador de playlists / álbumes desde YouTube Music / YouTube.
 Clon funcional de descargar_musica.py orientado a playlists:
-cada playlist se guarda en CarpetaBase / Artista - Álbum (año) /.
+cada playlist se guarda en CarpetaBase / Artista / NombreAlbum /.
 
-NO modifica descargar_musica.py.
+NO modifica descargar_musica.py (solo importa helpers).
 """
 
 from __future__ import annotations
@@ -14,12 +14,15 @@ import re
 import subprocess
 import threading
 import tkinter as tk
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 from descargar_musica import (
+    PARALLEL_DOWNLOADS,
     build_download_cmd,
     clean_filename,
+    ensure_artist_album_dir,
     fetch_video_info,
     find_existing_download,
     find_ffmpeg,
@@ -28,6 +31,7 @@ from descargar_musica import (
     song_artist_basename,
 )
 from metadata_extras import attach_lyrics_and_cover
+from link_catalog import LinkCatalog, refresh_link_catalog_window, show_link_catalog_window
 
 # Uploaders/canales que NO son el artista del álbum
 _INVALID_ARTISTS = {
@@ -406,15 +410,16 @@ def resolve_album_year(
     return None
 
 
-def playlist_folder_name(
+def playlist_artist_album(
     playlist_info: dict,
     log=None,
     base_cmd: list[str] | None = None,
-) -> str:
+) -> tuple[str, str]:
     """
-    Nombre de carpeta: 'Artista - Álbum (YYYY)'
-    Si no hay año: 'Artista - Álbum'
-    Enriquece artista/álbum desde entradas o la primera pista si el flat JSON viene pobre.
+    Artista y NombreAlbum para carpeta:
+    base / Artista / NombreAlbum /
+    Enriquece desde entradas o primera pista si el flat JSON viene pobre.
+    (Sin año en la ruta — más rápido al iniciar cada álbum.)
     """
     artist, track_info = resolve_playlist_artist(
         playlist_info, base_cmd=base_cmd, log=log
@@ -428,26 +433,25 @@ def playlist_folder_name(
             if log:
                 log(f"Álbum (pista completa): {album_name}")
 
-    year = resolve_album_year(
-        playlist_info,
-        artist,
-        album_name,
-        log=log,
-        track_info=track_info,
+    artist_clean = clean_filename(artist) if artist else ""
+    album_clean = clean_filename(album_name) if album_name else ""
+    if not artist_clean:
+        artist_clean = "Artista desconocido"
+    if not album_clean:
+        album_clean = "Sin álbum"
+    return artist_clean, album_clean
+
+
+def playlist_folder_name(
+    playlist_info: dict,
+    log=None,
+    base_cmd: list[str] | None = None,
+) -> str:
+    """Compat: ruta relativa 'Artista/NombreAlbum'."""
+    artist, album = playlist_artist_album(
+        playlist_info, log=log, base_cmd=base_cmd
     )
-
-    if artist and album_name:
-        base = f"{artist} - {album_name}"
-    elif album_name:
-        base = album_name
-    elif artist:
-        base = artist
-    else:
-        base = "playlist"
-
-    if year:
-        base = f"{base} ({year})"
-    return clean_filename(base)
+    return f"{artist}/{album}"
 
 
 def entry_watch_url(entry: dict) -> str | None:
@@ -522,6 +526,7 @@ class PlaylistApp(tk.Tk):
         self._last_clip: str | None = None
         self.clipboard_watch = tk.BooleanVar(value=True)
         self.format_mode = tk.StringVar(value="mp3")
+        self._link_catalog = LinkCatalog()
 
         self._build_ui()
         self.after(100, self._drain_log_queue)
@@ -535,7 +540,7 @@ class PlaylistApp(tk.Tk):
 
         ttk.Label(
             root,
-            text="Enlaces de playlist/álbum (uno por línea). Carpeta: Artista - Álbum (año)/:",
+            text="Enlaces de playlist/álbum (uno por línea). Carpeta: Artista / NombreAlbum /:",
         ).pack(anchor=tk.W, **pad)
 
         self.txt_urls = scrolledtext.ScrolledText(root, height=12, wrap=tk.WORD)
@@ -585,6 +590,9 @@ class PlaylistApp(tk.Tk):
             btn_row, text="Detener", command=self._stop_download, state=tk.DISABLED
         )
         self.btn_stop.pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(
+            btn_row, text="Listado…", command=self._open_link_list
+        ).pack(side=tk.LEFT, padx=(8, 0))
         self.progress = ttk.Progressbar(btn_row, mode="determinate")
         self.progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(12, 0))
 
@@ -593,6 +601,9 @@ class PlaylistApp(tk.Tk):
             root, height=10, wrap=tk.WORD, state=tk.DISABLED
         )
         self.txt_log.pack(fill=tk.BOTH, expand=True, **pad)
+
+    def _open_link_list(self) -> None:
+        show_link_catalog_window(self, self._link_catalog)
 
     def _choose_folder(self) -> None:
         path = filedialog.askdirectory(initialdir=self.download_dir.get())
@@ -716,8 +727,9 @@ class PlaylistApp(tk.Tk):
 
         self._log(f"Iniciando {len(urls)} playlist(s)…")
         self._log(f"Formato: {mode_label}")
+        self._log(f"Paralelo: hasta {PARALLEL_DOWNLOADS} a la vez")
         self._log(f"Carpeta base: {out_dir}")
-        self._log("Estructura: CarpetaBase / Artista - Álbum (año) / canción - artista")
+        self._log("Estructura: Artista / NombreAlbum / canción - artista")
         self._log("Extras: carátula + letra embebidas (1 solo archivo por pista)")
 
         self._worker = threading.Thread(
@@ -729,7 +741,7 @@ class PlaylistApp(tk.Tk):
 
     def _stop_download(self) -> None:
         self._stop_flag.set()
-        self._log("Detención solicitada… (terminará el archivo actual)")
+        self._log("Detención solicitada… (terminarán las descargas en curso)")
 
     def _download_one_track(
         self,
@@ -738,99 +750,202 @@ class PlaylistApp(tk.Tk):
         album_dir: Path,
         format_mode: str,
         counters: dict[str, int],
+        counters_lock: threading.Lock,
+        label: str = "",
     ) -> None:
-        info = fetch_video_info(base_cmd, track_url)
-        basename = song_artist_basename(info)
-        self._log(f"  Nombre: {basename}")
-
-        existing = find_existing_download(album_dir, basename)
-        if existing:
-            counters["skipped"] += 1
-            self._log(f"  ⊘ Ya estaba: {existing.name}")
-            return
-
-        cmd = build_download_cmd(
-            base_cmd, track_url, album_dir, format_mode, self._ffmpeg, basename
-        )
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-        assert process.stdout is not None
-        for line in process.stdout:
-            if self._stop_flag.is_set():
-                process.terminate()
-                try:
-                    process.wait(timeout=8)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                self._log("  Proceso actual detenido.")
-                break
-            line = line.rstrip()
-            if line:
-                self._log(line)
-        code = process.wait()
+        prefix = f"{label} " if label else "  "
         if self._stop_flag.is_set():
-            counters["fail"] += 1
+            with counters_lock:
+                counters["fail"] += 1
             return
-        if code == 0:
-            counters["ok"] += 1
-            self._log("  ✓ Completado")
-            audio_path = find_existing_download(album_dir, basename)
-            if audio_path:
-                attach_lyrics_and_cover(
-                    audio_path,
-                    basename,
-                    info,
-                    self._ffmpeg,
-                    self._log,
-                )
+
+        self._log(f"\n{prefix}{track_url}")
+        try:
+            info = fetch_video_info(base_cmd, track_url)
+            basename = song_artist_basename(info)
+            self._link_catalog.add(basename, track_url)
+            self.after(0, lambda: refresh_link_catalog_window(self))
+            self._log(f"{prefix}Nombre: {basename}")
+
+            existing = find_existing_download(album_dir, basename)
+            if existing:
+                with counters_lock:
+                    counters["skipped"] += 1
+                self._log(f"{prefix}⊘ Ya estaba: {existing.name}")
+                return
+
+            cmd = build_download_cmd(
+                base_cmd, track_url, album_dir, format_mode, self._ffmpeg, basename
+            )
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            assert process.stdout is not None
+            for line in process.stdout:
+                if self._stop_flag.is_set():
+                    process.terminate()
+                    try:
+                        process.wait(timeout=8)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                    self._log(f"{prefix}Proceso detenido.")
+                    break
+                line = line.rstrip()
+                if line:
+                    self._log(f"{prefix}{line}")
+            code = process.wait()
+            if self._stop_flag.is_set():
+                with counters_lock:
+                    counters["fail"] += 1
+                return
+            if code == 0:
+                with counters_lock:
+                    counters["ok"] += 1
+                self._log(f"{prefix}✓ Completado")
+                audio_path = find_existing_download(album_dir, basename)
+                if audio_path:
+                    attach_lyrics_and_cover(
+                        audio_path,
+                        basename,
+                        info,
+                        self._ffmpeg,
+                        self._log,
+                    )
+                else:
+                    self._log(
+                        f"{prefix}AVISO: audio OK pero no se encontró el archivo para extras"
+                    )
             else:
-                self._log("  AVISO: audio OK pero no se encontró el archivo para extras")
-        else:
-            counters["fail"] += 1
-            self._log(f"  ✗ Error (código {code})")
+                with counters_lock:
+                    counters["fail"] += 1
+                self._log(f"{prefix}✗ Error (código {code})")
+        except FileNotFoundError:
+            with counters_lock:
+                counters["fail"] += 1
+            self._log("✗ No se encontró yt-dlp.")
+            self._stop_flag.set()
+        except Exception as exc:  # noqa: BLE001
+            with counters_lock:
+                counters["fail"] += 1
+            self._log(f"{prefix}✗ Excepción: {exc}")
 
     def _download_all_playlists(
         self, playlist_urls: list[str], base_dir: Path, format_mode: str
     ) -> None:
+        """
+        Por cada playlist, en orden:
+        1) listar pistas + nombre de carpeta
+        2) crear SOLO esa carpeta
+        3) descargar sus pistas (hasta PARALLEL_DOWNLOADS en paralelo)
+        Así no se espera a resolver/crear todos los álbumes antes de empezar.
+        """
         base_cmd = find_yt_dlp()
         counters = {"ok": 0, "skipped": 0, "fail": 0}
-        # Primero resolver playlists para progress total
-        resolved: list[tuple[str, dict, list[dict], Path]] = []
-        total_tracks = 0
+        counters_lock = threading.Lock()
+        done = 0
+        done_lock = threading.Lock()
+        total_known = 0
+
+        self.after(0, lambda: self.progress.configure(maximum=1, value=0))
+        self._log(
+            "Carpetas: se crean una a una al iniciar cada álbum "
+            "(no se pre-crean todas)."
+        )
+        self._log(f"Paralelo: hasta {PARALLEL_DOWNLOADS} descargas a la vez")
+
+        def _bump_progress() -> None:
+            nonlocal done
+            with done_lock:
+                done += 1
+                current = done
+            self.after(0, lambda v=current: self.progress.configure(value=v))
 
         for p_index, purl in enumerate(playlist_urls, start=1):
             if self._stop_flag.is_set():
+                self._log("Descargas detenidas por el usuario.")
                 break
+
             self._log(f"\n=== Playlist {p_index}/{len(playlist_urls)} ===")
             self._log(purl)
             try:
                 plist = fetch_playlist_info(base_cmd, purl)
                 entries = playlist_entries(plist)
                 if not entries and plist.get("id") and plist.get("_type") != "playlist":
-                    # URL de un solo vídeo: tratar como “álbum” de 1 pista
                     entries = [plist]
-                folder = playlist_folder_name(
-                    plist, log=self._log, base_cmd=base_cmd
-                ) or clean_filename(song_artist_basename(plist))
                 if not entries:
-                    counters["fail"] += 1
+                    with counters_lock:
+                        counters["fail"] += 1
                     self._log("✗ Playlist vacía o no se pudieron listar pistas")
                     continue
-                album_dir = base_dir / folder
-                album_dir.mkdir(parents=True, exist_ok=True)
-                self._log(f"Álbum/carpeta: {folder} ({len(entries)} pista(s))")
+
+                # Artista / NombreAlbum / — reutiliza si existe, si no crea
+                artist_name, album_name = playlist_artist_album(
+                    plist, log=self._log, base_cmd=base_cmd
+                )
+                album_dir = ensure_artist_album_dir(base_dir, artist_name, album_name)
+                self._log(
+                    f"Álbum/carpeta: {artist_name} / {album_name} "
+                    f"({len(entries)} pista(s))"
+                )
                 self._log(f"Destino: {album_dir}")
-                resolved.append((purl, plist, entries, album_dir))
-                total_tracks += len(entries)
+
+                jobs: list[tuple[str, str]] = []
+                for t_index, entry in enumerate(entries, start=1):
+                    track_url = entry_watch_url(entry)
+                    if not track_url:
+                        with counters_lock:
+                            counters["fail"] += 1
+                        total_known += 1
+                        self.after(
+                            0,
+                            lambda m=total_known: self.progress.configure(maximum=m),
+                        )
+                        _bump_progress()
+                        continue
+                    jobs.append((track_url, f"[{t_index}/{len(entries)}]"))
+
+                total_known += len(jobs)
+                self.after(
+                    0,
+                    lambda m=total_known: self.progress.configure(maximum=max(m, 1)),
+                )
+                self._log(f"Pistas de este álbum en cola: {len(jobs)}")
+
+                if not jobs:
+                    continue
+
+                with ThreadPoolExecutor(max_workers=PARALLEL_DOWNLOADS) as pool:
+                    futures = [
+                        pool.submit(
+                            self._download_one_track,
+                            base_cmd,
+                            track_url,
+                            album_dir,
+                            format_mode,
+                            counters,
+                            counters_lock,
+                            label,
+                        )
+                        for track_url, label in jobs
+                    ]
+                    for fut in as_completed(futures):
+                        try:
+                            fut.result()
+                        except Exception as exc:  # noqa: BLE001
+                            with counters_lock:
+                                counters["fail"] += 1
+                            self._log(f"✗ Excepción en worker: {exc}")
+                        _bump_progress()
+
             except FileNotFoundError:
-                counters["fail"] += 1
+                with counters_lock:
+                    counters["fail"] += 1
                 self._log(
                     "✗ No se encontró yt-dlp. Instálalo con:\n"
                     "  python -m pip install yt-dlp"
@@ -838,49 +953,16 @@ class PlaylistApp(tk.Tk):
                 self.after(0, lambda: self._set_busy(False))
                 return
             except Exception as exc:  # noqa: BLE001
-                counters["fail"] += 1
+                with counters_lock:
+                    counters["fail"] += 1
                 self._log(f"✗ No se pudo leer la playlist: {exc}")
 
-        if total_tracks <= 0:
-            self._log("\nNo hay pistas para descargar.")
-            self.after(0, lambda: self._set_busy(False))
-            return
-
-        self.after(0, lambda: self.progress.configure(maximum=total_tracks, value=0))
-        done = 0
-
-        for purl, _plist, entries, album_dir in resolved:
-            if self._stop_flag.is_set():
-                self._log("Descargas detenidas por el usuario.")
-                break
-            self._log(f"\n--- Descargando en: {album_dir.name} ---")
-            for t_index, entry in enumerate(entries, start=1):
-                if self._stop_flag.is_set():
-                    self._log("Descargas detenidas por el usuario.")
-                    break
-                track_url = entry_watch_url(entry)
-                if not track_url:
-                    counters["fail"] += 1
-                    done += 1
-                    self.after(0, lambda v=done: self.progress.configure(value=v))
-                    continue
-                self._log(f"\n[{t_index}/{len(entries)}] {track_url}")
-                try:
-                    self._download_one_track(
-                        base_cmd, track_url, album_dir, format_mode, counters
-                    )
-                except FileNotFoundError:
-                    counters["fail"] += 1
-                    self._log("✗ No se encontró yt-dlp.")
-                    self.after(0, lambda: self._set_busy(False))
-                    return
-                except Exception as exc:  # noqa: BLE001
-                    counters["fail"] += 1
-                    self._log(f"✗ Excepción: {exc}")
-                done += 1
-                self.after(0, lambda v=done: self.progress.configure(value=v))
+        if self._stop_flag.is_set():
+            self._log("Descargas detenidas por el usuario.")
 
         ok, skipped, fail = counters["ok"], counters["skipped"], counters["fail"]
+        if total_known <= 0 and ok == 0 and skipped == 0:
+            self._log("\nNo hay pistas para descargar.")
         self._log(
             f"\nListo. Descargadas: {ok} | Ya estaban: {skipped} | Fallidos: {fail}"
         )
