@@ -26,8 +26,8 @@ from metadata_extras import attach_lyrics_and_cover
 from link_catalog import LinkCatalog, refresh_link_catalog_window, show_link_catalog_window
 
 AUDIO_EXTENSIONS = {".mp3", ".webm", ".m4a", ".opus", ".ogg", ".flac", ".wav", ".aac"}
-# Solo velocidad: 2 pistas a la vez (no afecta calidad/formato)
-PARALLEL_DOWNLOADS = 2
+# Solo velocidad: 1 pista a la vez (no afecta calidad/formato)
+PARALLEL_DOWNLOADS = 1
 ID_NAME_CACHE = ".yt_id_names.json"
 STAGING_DIRNAME = ".staging"
 
@@ -56,6 +56,43 @@ def yt_dlp_js_runtime_args() -> list[str]:
     if which("node"):
         return ["--js-runtimes", "node"]
     return []
+
+
+def yt_dlp_remote_components_args() -> list[str]:
+    """Script EJS remoto (challenge JS). No cambia bestaudio/formato."""
+    return ["--remote-components", "ejs:github"]
+
+
+def yt_dlp_cookies_args(cookies_file: str | Path | None = None) -> list[str]:
+    """
+    --cookies si hay archivo. Lee prefs compartidas si no se pasa ruta.
+    No cambia calidad/formato.
+    """
+    path: Path | None = None
+    if cookies_file is not None and str(cookies_file).strip():
+        path = Path(str(cookies_file).strip()).expanduser()
+        try:
+            path = path.resolve()
+        except OSError:
+            path = None
+        if path is not None and not path.is_file():
+            path = None
+    else:
+        path = dlstate.get_cookies_path()
+    if path is None:
+        return []
+    return ["--cookies", str(path)]
+
+
+def default_cookies_suggestion() -> str:
+    """Sugiere Desktop/cookies.txt si existe; si no, la preferencia guardada."""
+    saved = dlstate.get_cookies_path_text()
+    if saved:
+        return saved
+    desktop = Path.home() / "Desktop" / "cookies.txt"
+    if desktop.is_file():
+        return str(desktop)
+    return ""
 
 
 def is_transient_yt_block(text: str) -> bool:
@@ -224,6 +261,8 @@ def fetch_video_info(base_cmd: list[str], url: str) -> dict:
     cmd = [
         *base_cmd,
         *yt_dlp_js_runtime_args(),
+        *yt_dlp_remote_components_args(),
+        *yt_dlp_cookies_args(),
         "--skip-download",
         "--no-playlist",
         "-J",
@@ -277,10 +316,12 @@ def build_download_cmd(
     cmd = [
         *base_cmd,
         *yt_dlp_js_runtime_args(),
+        *yt_dlp_remote_components_args(),
+        *yt_dlp_cookies_args(),
         "-f",
         "bestaudio",
         "-N",
-        "16",
+        "1",
         "-o",
         out_tmpl,
         "--no-playlist",
@@ -588,6 +629,7 @@ class App(tk.Tk):
         self._last_clip: str | None = None
         self.clipboard_watch = tk.BooleanVar(value=True)
         self.format_mode = tk.StringVar(value="mp3")
+        self.cookies_file = tk.StringVar(value=default_cookies_suggestion())
         self._link_catalog = LinkCatalog()
         self._active_batch_id: str | None = None
         self._poll_after_id: str | None = None
@@ -601,6 +643,8 @@ class App(tk.Tk):
         self.after(200, self._check_deps)
         self.after(400, self._poll_clipboard)
         self.after(600, self._resume_background_if_needed)
+        # Persistir sugerencia inicial para el worker si el archivo existe
+        self._sync_cookies_prefs()
 
     def _build_ui(self) -> None:
         pad = {"padx": 12, "pady": 6}
@@ -666,6 +710,19 @@ class App(tk.Tk):
             side=tk.LEFT
         )
 
+        cookies_row = ttk.Frame(root)
+        cookies_row.pack(fill=tk.X, **pad)
+        ttk.Label(cookies_row, text="Cookies:").pack(side=tk.LEFT)
+        ttk.Entry(cookies_row, textvariable=self.cookies_file).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 8)
+        )
+        ttk.Button(
+            cookies_row, text="Elegir…", command=self._choose_cookies
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            cookies_row, text="Quitar", command=self._clear_cookies
+        ).pack(side=tk.LEFT, padx=(8, 0))
+
         btn_row = ttk.Frame(root)
         btn_row.pack(fill=tk.X, **pad)
         self.btn_download = ttk.Button(
@@ -702,6 +759,39 @@ class App(tk.Tk):
         path = filedialog.askdirectory(initialdir=self.download_dir.get())
         if path:
             self.download_dir.set(path)
+
+    def _choose_cookies(self) -> None:
+        initial = self.cookies_file.get().strip()
+        initial_dir = str(Path(initial).parent) if initial else str(Path.home() / "Desktop")
+        path = filedialog.askopenfilename(
+            title="Elegir cookies.txt",
+            initialdir=initial_dir,
+            filetypes=[
+                ("Cookies Netscape", "*.txt"),
+                ("Todos los archivos", "*.*"),
+            ],
+        )
+        if path:
+            self.cookies_file.set(path)
+            self._sync_cookies_prefs(announce=True)
+
+    def _clear_cookies(self) -> None:
+        self.cookies_file.set("")
+        self._sync_cookies_prefs(announce=True)
+
+    def _sync_cookies_prefs(self, *, announce: bool = False) -> None:
+        """Guarda la ruta de cookies para la UI y el worker en segundo plano."""
+        text = self.cookies_file.get().strip()
+        dlstate.set_cookies_path(text or None)
+        if not announce:
+            return
+        path = Path(text) if text else None
+        if not text:
+            self._log("Cookies: (ninguno)")
+        elif path is None or not path.is_file():
+            self._log(f"AVISO: cookies no encontradas: {text}")
+        else:
+            self._log(f"Cookies: {text}")
 
     def _read_clipboard(self) -> str:
         try:
@@ -1116,6 +1206,7 @@ class App(tk.Tk):
             self._set_busy(False)
             return
         self._clear_download_log()
+        self._sync_cookies_prefs(announce=True)
         self._reset_eta_clock(resume=False)
         self._set_total_speed([])
         self._set_eta(finished=0, total=1, live=[], active=False)

@@ -29,6 +29,7 @@ from descargar_musica import (
     cache_remember,
     clean_filename,
     cleanup_staging_id,
+    default_cookies_suggestion,
     ensure_artist_album_dir,
     extract_youtube_id,
     fetch_video_info,
@@ -43,7 +44,9 @@ from descargar_musica import (
     promote_staged_to_dest,
     scrub_delivery_artifacts,
     song_artist_basename,
+    yt_dlp_cookies_args,
     yt_dlp_js_runtime_args,
+    yt_dlp_remote_components_args,
 )
 from metadata_extras import attach_lyrics_and_cover
 from link_catalog import LinkCatalog, refresh_link_catalog_window, show_link_catalog_window
@@ -498,6 +501,8 @@ def fetch_playlist_info(base_cmd: list[str], url: str) -> dict:
     cmd = [
         *base_cmd,
         *yt_dlp_js_runtime_args(),
+        *yt_dlp_remote_components_args(),
+        *yt_dlp_cookies_args(),
         "--skip-download",
         "--flat-playlist",
         "-J",
@@ -547,6 +552,7 @@ class PlaylistApp(tk.Tk):
         self._last_clip: str | None = None
         self.clipboard_watch = tk.BooleanVar(value=True)
         self.format_mode = tk.StringVar(value="mp3")
+        self.cookies_file = tk.StringVar(value=default_cookies_suggestion())
         self._link_catalog = LinkCatalog()
         self._active_batch_id: str | None = None
         self._poll_after_id: str | None = None
@@ -560,6 +566,7 @@ class PlaylistApp(tk.Tk):
         self.after(200, self._check_deps)
         self.after(400, self._poll_clipboard)
         self.after(600, self._resume_background_if_needed)
+        self._sync_cookies_prefs()
 
     def _build_ui(self) -> None:
         pad = {"padx": 12, "pady": 6}
@@ -625,6 +632,19 @@ class PlaylistApp(tk.Tk):
             side=tk.LEFT
         )
 
+        cookies_row = ttk.Frame(root)
+        cookies_row.pack(fill=tk.X, **pad)
+        ttk.Label(cookies_row, text="Cookies:").pack(side=tk.LEFT)
+        ttk.Entry(cookies_row, textvariable=self.cookies_file).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 8)
+        )
+        ttk.Button(
+            cookies_row, text="Elegir…", command=self._choose_cookies
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            cookies_row, text="Quitar", command=self._clear_cookies
+        ).pack(side=tk.LEFT, padx=(8, 0))
+
         btn_row = ttk.Frame(root)
         btn_row.pack(fill=tk.X, **pad)
         self.btn_download = ttk.Button(
@@ -661,6 +681,39 @@ class PlaylistApp(tk.Tk):
         path = filedialog.askdirectory(initialdir=self.download_dir.get())
         if path:
             self.download_dir.set(path)
+
+    def _choose_cookies(self) -> None:
+        initial = self.cookies_file.get().strip()
+        initial_dir = str(Path(initial).parent) if initial else str(Path.home() / "Desktop")
+        path = filedialog.askopenfilename(
+            title="Elegir cookies.txt",
+            initialdir=initial_dir,
+            filetypes=[
+                ("Cookies Netscape", "*.txt"),
+                ("Todos los archivos", "*.*"),
+            ],
+        )
+        if path:
+            self.cookies_file.set(path)
+            self._sync_cookies_prefs(announce=True)
+
+    def _clear_cookies(self) -> None:
+        self.cookies_file.set("")
+        self._sync_cookies_prefs(announce=True)
+
+    def _sync_cookies_prefs(self, *, announce: bool = False) -> None:
+        """Guarda la ruta de cookies para la UI y el worker en segundo plano."""
+        text = self.cookies_file.get().strip()
+        dlstate.set_cookies_path(text or None)
+        if not announce:
+            return
+        path = Path(text) if text else None
+        if not text:
+            self._log("Cookies: (ninguno)")
+        elif path is None or not path.is_file():
+            self._log(f"AVISO: cookies no encontradas: {text}")
+        else:
+            self._log(f"Cookies: {text}")
 
     def _read_clipboard(self) -> str:
         try:
@@ -1070,6 +1123,7 @@ class PlaylistApp(tk.Tk):
             return
 
         self._clear_download_log()
+        self._sync_cookies_prefs(announce=True)
         self._reset_eta_clock(resume=False)
         self._set_total_speed([])
         self._set_eta(finished=0, total=1, live=[], active=False)

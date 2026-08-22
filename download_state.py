@@ -23,6 +23,7 @@ PID_PATH = QUEUE_DIR / "worker.pid"
 STOP_PATH = QUEUE_DIR / "stop.flag"
 LOG_PATH = QUEUE_DIR / "worker.log"
 PROGRESS_PATH = QUEUE_DIR / "live_progress.json"
+UI_PREFS_PATH = QUEUE_DIR / "ui_prefs.json"
 WORKER_SCRIPT = ROOT / "download_worker.py"
 
 _progress_lock = threading.Lock()
@@ -38,6 +39,57 @@ STATUS_CANCELLED = "cancelled"
 def ensure_queue_dir() -> Path:
     QUEUE_DIR.mkdir(parents=True, exist_ok=True)
     return QUEUE_DIR
+
+
+def load_ui_prefs() -> dict:
+    """Preferencias ligeras de UI (p. ej. ruta cookies.txt)."""
+    ensure_queue_dir()
+    if not UI_PREFS_PATH.is_file():
+        return {}
+    try:
+        data = json.loads(UI_PREFS_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_ui_prefs(prefs: dict) -> None:
+    ensure_queue_dir()
+    tmp = UI_PREFS_PATH.with_suffix(".tmp")
+    tmp.write_text(
+        json.dumps(prefs, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    tmp.replace(UI_PREFS_PATH)
+
+
+def get_cookies_path() -> Path | None:
+    """Ruta a cookies.txt si está configurada y el archivo existe."""
+    raw = str(load_ui_prefs().get("cookies_file") or "").strip()
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    try:
+        path = path.resolve()
+    except OSError:
+        return None
+    return path if path.is_file() else None
+
+
+def get_cookies_path_text() -> str:
+    """Texto guardado de cookies (aunque el archivo aún no exista)."""
+    return str(load_ui_prefs().get("cookies_file") or "").strip()
+
+
+def set_cookies_path(path: str | None) -> None:
+    """Guarda o limpia la ruta de cookies para UI + worker."""
+    prefs = load_ui_prefs()
+    text = (path or "").strip()
+    if text:
+        prefs["cookies_file"] = str(Path(text).expanduser())
+    else:
+        prefs.pop("cookies_file", None)
+    save_ui_prefs(prefs)
 
 
 def connect() -> sqlite3.Connection:
